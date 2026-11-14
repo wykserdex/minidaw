@@ -66,6 +66,7 @@ class KnobView(context: Context) : View(context) {
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                parent.requestDisallowInterceptTouchEvent(true)
                 dragStartY = event.y
                 dragStartFraction = fraction
             }
@@ -78,6 +79,7 @@ class KnobView(context: Context) : View(context) {
                     onFraction?.invoke(fraction)
                 }
             }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> parent.requestDisallowInterceptTouchEvent(false)
         }
         return true
     }

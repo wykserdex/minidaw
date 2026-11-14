@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "LocalDefinitions.h"
@@ -44,20 +45,38 @@ namespace aap {
         MidiSourceNode midi_input;
         MidiDestinationNode midi_output;
         std::vector<AudioGraphNode*> nodes{};
-        // Generators that share one summing bus, then the serial inserts. Reserved once in the
-        // constructor: the audio thread iterates `nodes` while the UI thread rebuilds it.
         std::vector<std::unique_ptr<AudioPluginNode>> sum_nodes{};
         std::vector<std::unique_ptr<AudioPluginNode>> chain_nodes{};
-        bool is_processing{false};
-        // Peak of the most recent callback per channel: one relaxed store per block on the audio
-        // thread, read from the UI thread. It holds the last block, not an average.
+        std::vector<std::unique_ptr<AudioTrackNode>> audio_tracks{};
+        static constexpr uint64_t max_audio_track_bytes = 64ULL * 1024 * 1024;
+        uint64_t decoded_audio_track_bytes{0};
+        std::atomic<float> master_gain{1.0f};
+        std::mutex control_mutex{};
+        std::atomic<bool> control_gate{true};
+        std::atomic<int32_t> callbacks_in_flight{0};
+        std::atomic<bool> is_processing{false};
         std::array<std::atomic<float>, max_metered_channels> peak_levels{};
+        std::atomic<int64_t> frames_processed{0};
+
+        class ControlScope {
+            SimpleLinearAudioGraph& graph;
+            std::unique_lock<std::mutex> lock;
+        public:
+            explicit ControlScope(SimpleLinearAudioGraph& graph);
+            ~ControlScope();
+        };
 
         static void audio_callback(void* callbackContext, AudioBuffer* audioData, int32_t numFrames) {
             ((SimpleLinearAudioGraph*) callbackContext)->processAudio(audioData, numFrames);
         }
 
         void rebuild_nodes();
+        void set_plugin_locked(RemotePluginInstance* instance);
+        AudioPluginNode* find_plugin_node(RemotePluginInstance* instance);
+        AudioTrackNode* find_audio_track(int trackId);
+        void silence(AudioBuffer* audioData);
+        void apply_master_gain_and_meter(AudioBuffer* audioData, int32_t numFrames);
+        void pause_nodes();
 
     public:
         SimpleLinearAudioGraph(int32_t sampleRate, uint32_t framesPerCallback, int32_t channelsInAudioBus);
@@ -68,13 +87,24 @@ namespace aap {
         // Appends another plugin node to the chain, processed after the existing ones.
         void addPlugin(RemotePluginInstance* instance);
 
-        // Adds a generator to the summing bus: it is fed silence and mixed into the first plugin's
-        // output instead of replacing it. The bus runs before the serial chain.
+        // Always adds a silence-fed generator to the bus, before the serial chain.
         void addPluginToSumBus(RemotePluginInstance* instance);
+
+        // Always appends a serial effect, even without a primary plugin or generator.
+        void addMasterEffect(RemotePluginInstance* instance);
+        void setMasterGain(float gain);
+
+        int addAudioTrack();
+        bool loadAudioTrack(int trackId, uint8_t* bytes, int dataLength, const char* filename);
+        void setAudioTrackGain(int trackId, float gain);
+        float getAudioTrackPeak(int trackId);
 
         // Routes only the UMP groups set in the mask to the node that hosts this instance.
         // 0xFFFF broadcasts to every group (the original behaviour) and 0 mutes its MIDI input.
         void setPluginMidiGroups(RemotePluginInstance* instance, uint32_t group_mask);
+
+        void setPluginGain(RemotePluginInstance* instance, float gain);
+        float getPluginPeak(RemotePluginInstance* instance);
 
         void setAudioSource(uint8_t *data, int dataLength, const char *filename);
 
@@ -84,13 +114,15 @@ namespace aap {
 
         void playAudioData();
 
-        bool isProcessing() { return is_processing; }
+        bool isProcessing() { return is_processing.load(std::memory_order_relaxed); }
 
         // Peak of the last processed block for one channel; 0 for channels the bus does not have.
         float getPeakLevel(int32_t channel) {
             return channel < 0 || channel >= max_metered_channels
                    ? 0.0f : peak_levels[channel].load(std::memory_order_relaxed);
         }
+
+        int64_t getProcessedFrames() { return frames_processed.load(std::memory_order_relaxed); }
 
         void startProcessing();
 

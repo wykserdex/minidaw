@@ -37,12 +37,41 @@ class PluginPlayer private constructor(private val native: Long) : AutoCloseable
 
     private external fun addPluginNative(player: Long, nativeClient: Long, instanceId: Int)
 
-    // Adds a generator to the summing bus: it is mixed into the first plugin's output rather than
-    // replacing it, so several instruments can sound at once.
+    // Always adds a silence-fed generator to the bus, before the serial master effects.
     fun addPluginToSumBus(plugin: NativeRemotePluginInstance) =
         addPluginToSumBusNative(native, plugin.client, plugin.instanceId)
 
     private external fun addPluginToSumBusNative(player: Long, nativeClient: Long, instanceId: Int)
+
+    // Serial effects also work before any instrument or audio track has been added.
+    fun addMasterEffect(plugin: NativeRemotePluginInstance) =
+        addMasterEffectNative(native, plugin.client, plugin.instanceId)
+
+    private external fun addMasterEffectNative(player: Long, nativeClient: Long, instanceId: Int)
+
+    fun setMasterGain(gain: Float) = setMasterGainNative(native, gain)
+
+    private external fun setMasterGainNative(player: Long, gain: Float)
+
+    // IDs are sequential from zero; -1 means the node could not be allocated.
+    fun addAudioTrack(): Int = addAudioTrackNative(native)
+
+    private external fun addAudioTrackNative(player: Long): Int
+
+    // One-shot clips restart with the transport. Failed loads preserve the previous clip.
+    fun loadAudioTrack(trackId: Int, bytes: ByteArray, filename: String): Boolean =
+        loadAudioTrackNative(native, trackId, bytes, filename)
+
+    private external fun loadAudioTrackNative(player: Long, trackId: Int, bytes: ByteArray, filename: String): Boolean
+
+    fun setAudioTrackGain(trackId: Int, gain: Float) = setAudioTrackGainNative(native, trackId, gain)
+
+    private external fun setAudioTrackGainNative(player: Long, trackId: Int, gain: Float)
+
+    // Last-block post-gain peak before the track is mixed into the bus.
+    fun getAudioTrackPeak(trackId: Int): Float = getAudioTrackPeakNative(native, trackId)
+
+    private external fun getAudioTrackPeakNative(player: Long, trackId: Int): Float
 
     // Feeds only the UMP groups set in the mask to the plugin node that hosts it.
     // 0xFFFF is the broadcast, 0 mutes the node's MIDI input.
@@ -51,10 +80,27 @@ class PluginPlayer private constructor(private val native: Long) : AutoCloseable
 
     private external fun setPluginMidiGroupsNative(player: Long, nativeClient: Long, instanceId: Int, groupMask: Int)
 
-    // Peak of the most recently processed block, left then right, 0..1.
+    // Linear audio gain; zero mutes audio without suppressing MIDI or note-offs.
+    fun setPluginGain(plugin: NativeRemotePluginInstance, gain: Float) =
+        setPluginGainNative(native, plugin.client, plugin.instanceId, gain)
+
+    private external fun setPluginGainNative(player: Long, nativeClient: Long, instanceId: Int, gain: Float)
+
+    // Last-block post-gain peak across the plugin's output channels, before summing.
+    fun getPluginPeak(plugin: NativeRemotePluginInstance): Float =
+        getPluginPeakNative(native, plugin.client, plugin.instanceId)
+
+    private external fun getPluginPeakNative(player: Long, nativeClient: Long, instanceId: Int): Float
+
+    // Peak of the most recently processed block, left then right.
     val peakLevels: FloatArray get() = getPeakLevelsNative(native)
 
     private external fun getPeakLevelsNative(player: Long): FloatArray
+
+    // Audio-clock position in frames; reset when the transport starts, not a wall clock.
+    val transportFrames: Long get() = getTransportFramesNative(native)
+
+    private external fun getTransportFramesNative(player: Long): Long
 
     fun loadAudioResource(bytes: ByteArray, filename: String) =
         loadAudioResourceNative(native, bytes, filename)

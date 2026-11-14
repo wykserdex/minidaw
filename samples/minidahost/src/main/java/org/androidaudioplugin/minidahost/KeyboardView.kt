@@ -9,13 +9,15 @@ import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.View
 
-/**
- * Two-octave piano strip. Keys are laid out geometrically and hit-tested black-first, so a
- * finger between two white keys selects the black one that is drawn on top.
- */
 class KeyboardView(context: Context) : View(context) {
 
     var firstNote = 48
+        set(value) {
+            releaseKey()
+            field = value
+            layoutKeys()
+            invalidate()
+        }
     var noteCount = 25
         set(value) {
             field = value
@@ -103,6 +105,12 @@ class KeyboardView(context: Context) : View(context) {
             }
         }
         return true
+    }
+
+    fun releaseKey() {
+        if (pressedNote >= 0) onNote?.invoke(pressedNote, false)
+        pressedNote = -1
+        invalidate()
     }
 
     private fun keyAt(x: Float, y: Float): Int {

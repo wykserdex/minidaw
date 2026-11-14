@@ -1,6 +1,8 @@
 #ifndef AAP_CORE_AUDIOGRAPHNODE_H
 #define AAP_CORE_AUDIOGRAPHNODE_H
 
+#include <atomic>
+#include <mutex>
 #include "AudioDevice.h"
 #include "AAPMidiEventTranslator.h"
 #include <aap/core/host/plugin-instance.h>
@@ -91,21 +93,30 @@ namespace aap {
     };
 
     class AudioPluginNode : public AudioGraphNode {
-        RemotePluginInstance* plugin;
-        // While the plugin is being prepared again (its buses changed), processAudio() skips it.
+        RemotePluginInstance* plugin{nullptr};
+        std::mutex control_mutex{};
         std::atomic<bool> reconfiguring{false};
         std::atomic<int32_t> processing{0};
+        std::atomic<float> audio_gain{1.0f};
+        std::atomic<float> last_block_peak{0.0f};
         // UMP groups this node is fed, one bit per group; 0xFFFF keeps the original broadcast.
         std::atomic<uint32_t> midi_group_mask{0xFFFF};
-        // A generator on the summing bus: it is fed silence and its output is added to the shared
-        // buffer instead of replacing it. Set before the node is published to the graph.
+        // Set before publication: generators receive silence and add their output to the bus.
         bool sum_into_bus{false};
         void onBusesChanged(uint32_t flags);
 
+        class ControlScope {
+            AudioPluginNode& node;
+            std::unique_lock<std::mutex> lock;
+        public:
+            explicit ControlScope(AudioPluginNode& node);
+            ~ControlScope();
+        };
+
     public:
-        AudioPluginNode(AudioGraph* ownerGraph, RemotePluginInstance* plugin) :
-                AudioGraphNode(ownerGraph),
-                plugin(plugin) {
+        AudioPluginNode(AudioGraph* ownerGraph, RemotePluginInstance* instance) :
+                AudioGraphNode(ownerGraph) {
+            setPlugin(instance);
         }
         ~AudioPluginNode() override;
 
@@ -114,6 +125,9 @@ namespace aap {
         RemotePluginInstance* getPlugin() const { return plugin; }
 
         void setMidiGroupMask(uint32_t mask) { midi_group_mask.store(mask, std::memory_order_relaxed); }
+
+        void setGain(float gain);
+        float getPeak() const { return last_block_peak.load(std::memory_order_relaxed); }
 
         void setSumIntoBus(bool value) { sum_into_bus = value; }
 
@@ -129,8 +143,8 @@ namespace aap {
     class AudioDataSourceNode : public AudioGraphNode {
         bool active{false};
         bool playing{false};
+        // Data and playback state are changed only under the graph's ControlScope.
         std::unique_ptr<AudioBuffer> audio_data{nullptr};
-        NanoSleepLock data_source_mutex{};
 
         int32_t current_frame_offset{0};
 
@@ -152,12 +166,32 @@ namespace aap {
         /// returns the size in frames that were successfully read. 0 if it is empty.
         int32_t read(AudioBuffer* dst, int32_t numFrames);
 
-        /// Sets PCM data of some formats, as indicated by the filename.
-        /// Currently ogg, mp3 and wav formats work.
-        /// Returns true if loaded successfully, false if not.
-        ///
-        /// It locks the data source until it finishes loading and converting data into `audio_data`.
+        /// Decodes WAV, MP3, Ogg or FLAC. Failure leaves the old data intact.
+        /// The caller must hold the graph's ControlScope, never call from the audio callback.
         bool setAudioSource(uint8_t *data, int dataLength, const char *filename);
+    };
+
+    class AudioTrackNode : public AudioGraphNode {
+        using Clip = choc::buffer::ChannelArrayBuffer<float>;
+        std::unique_ptr<Clip> clip{};
+        uint32_t current_frame_offset{0};
+        bool active{false};
+        std::atomic<float> audio_gain{1.0f};
+        std::atomic<float> last_block_peak{0.0f};
+
+    public:
+        explicit AudioTrackNode(AudioGraph* ownerGraph) : AudioGraphNode(ownerGraph) {}
+
+        void start() override;
+        void pause() override;
+        void processAudio(AudioBuffer* audioData, int32_t numFrames) override;
+        void setGain(float gain);
+        float getPeak() const { return last_block_peak.load(std::memory_order_relaxed); }
+        uint64_t getDecodedBytes() const;
+
+        // Publication/replacement and decoding require the graph's ControlScope.
+        // The budget includes decoding buffers, while the previous clip remains alive.
+        bool load(uint8_t* bytes, int dataLength, const char* filename, uint64_t byteBudget);
     };
 
 
@@ -168,7 +202,6 @@ namespace aap {
         NanoSleepLock midi_buffer_mutex{};
         AAPMidiEventTranslator translator;
 
-        // needed for sample accurate time calculation
         int32_t sample_rate{0};
         int32_t aap_frame_size{1024};
         struct timespec last_aap_process_time{0, 0};

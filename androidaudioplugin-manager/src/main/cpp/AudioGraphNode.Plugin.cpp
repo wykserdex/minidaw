@@ -2,6 +2,7 @@
 #include "AudioGraphNode.h"
 #include "LocalDefinitions.h"
 #include "include_cmidi2.h"
+#include <cmath>
 #include <thread>
 
 namespace {
@@ -44,34 +45,56 @@ namespace {
     }
 }
 
+aap::AudioPluginNode::ControlScope::ControlScope(AudioPluginNode& owner) :
+        node(owner), lock(owner.control_mutex) {
+    node.reconfiguring.store(true);
+    while (node.processing.load() != 0)
+        std::this_thread::yield();
+}
+
+aap::AudioPluginNode::ControlScope::~ControlScope() {
+    node.reconfiguring.store(false);
+}
+
 aap::AudioPluginNode::~AudioPluginNode() {
-    if (!plugin)
-        return;
-    plugin->setBusesChangedHandler({});
-    plugin->deactivate();
-    // The plugin is not disposed here; somewhere that instantiates the plugin should do the job.
+    setPlugin(nullptr);
 }
 
 void aap::AudioPluginNode::setPlugin(RemotePluginInstance* instance) {
+    if (plugin == instance)
+        return;
+    // Clearing waits for the worker; registering can invoke it inline. Neither holds our mutex.
     if (plugin)
         plugin->setBusesChangedHandler({});
-    plugin = instance;
+    {
+        ControlScope control{*this};
+        if (plugin && plugin->getInstanceState() == PLUGIN_INSTANTIATION_STATE_ACTIVE)
+            plugin->deactivate();
+        plugin = instance;
+        audio_gain.store(1.0f, std::memory_order_relaxed);
+        last_block_peak.store(0.0f, std::memory_order_relaxed);
+    }
     if (plugin)
         plugin->setBusesChangedHandler([this](uint32_t flags) { onBusesChanged(flags); });
 }
 
-// Invoked on the extension worker, or in setPlugin() for earlier changes: prepare the plugin
-// again for its new bus layout. An unprepared plugin only refreshes it; start() prepares it.
+void aap::AudioPluginNode::setGain(float gain) {
+    audio_gain.store(std::isfinite(gain) ? std::max(0.0f, gain) : 0.0f,
+                     std::memory_order_relaxed);
+}
+
 void aap::AudioPluginNode::onBusesChanged(uint32_t flags) {
-    if (!(flags & AAP_BUSES_CHANGED_LAYOUT) || !plugin)
+    if (!(flags & AAP_BUSES_CHANGED_LAYOUT))
         return;
-    reconfiguring = true;
-    while (processing.load() != 0)
-        std::this_thread::yield();
+    ControlScope control{*this};
+    if (!plugin)
+        return;
+    last_block_peak.store(0.0f, std::memory_order_relaxed);
     auto state = plugin->getInstanceState();
     bool wasActive = state == PLUGIN_INSTANTIATION_STATE_ACTIVE;
     bool wasPrepared = wasActive || state == PLUGIN_INSTANTIATION_STATE_INACTIVE;
-    plugin->deactivate();
+    if (wasActive)
+        plugin->deactivate();
     // Keep the event buffer size that the instance was prepared with.
     auto buffer = plugin->getAudioPluginBuffer();
     auto eventIn = plugin->getMainEventPortIndex(AAP_PORT_DIRECTION_INPUT);
@@ -83,7 +106,6 @@ void aap::AudioPluginNode::onBusesChanged(uint32_t flags) {
             plugin->activate();
     } else if (!error.empty())
         aap::a_log_f(AAP_LOG_LEVEL_ERROR, AAP_MANAGER_LOG_TAG, "Failed to refresh the bus layout: %s", error.c_str());
-    reconfiguring = false;
 }
 
 bool aap::AudioPluginNode::shouldSkip() {
@@ -91,12 +113,16 @@ bool aap::AudioPluginNode::shouldSkip() {
 }
 
 void aap::AudioPluginNode::processAudio(AudioBuffer *audioData, int32_t numFrames) {
-    if (!plugin)
+    processing.fetch_add(1);
+    struct ProcessingScope {
+        std::atomic<int32_t>& count;
+        ~ProcessingScope() { count.fetch_sub(1); }
+    } scope{processing};
+    if (reconfiguring.load() || !plugin ||
+        plugin->getInstanceState() != PLUGIN_INSTANTIATION_STATE_ACTIVE) {
+        last_block_peak.store(0.0f, std::memory_order_relaxed);
         return;
-    processing++;
-    struct ProcessingScope { std::atomic<int32_t>& count; ~ProcessingScope() { count--; } } scope{processing};
-    if (reconfiguring.load())
-        return;
+    }
 
     // Copy input audioData into each plugin's buffer (it is inevitable; each plugin has
     // shared memory between the service and this host, which are not sharable with other plugins
@@ -128,16 +154,21 @@ void aap::AudioPluginNode::processAudio(AudioBuffer *audioData, int32_t numFrame
     plugin->process(numFrames, 0); // FIXME: timeout?
 
     auto audioOut = plugin->getBus(AAP_BUS_KIND_AUDIO, AAP_PORT_DIRECTION_OUTPUT, 0);
+    const auto gain = audio_gain.load(std::memory_order_relaxed);
+    float peak = 0.0f;
     for (int32_t ch = 0, n = audioOut ? std::min(audioOut->getChannelCount(), numChannels) : 0; ch < n; ch++) {
         auto dst = audioData->audio.getView().getChannel(ch).data.data;
         auto src = (const float *) aapBuffer->get_buffer(aapBuffer, audioOut->getPortIndex(ch));
-        if (sum_into_bus)
-            // The bus head already wrote its channel here; every other generator is mixed in.
-            for (int32_t i = 0; i < numFrames; i++)
-                dst[i] += src[i];
-        else
-            memcpy(dst, src, numFrames * sizeof(float));
+        for (int32_t i = 0; i < numFrames; i++) {
+            const auto sample = gain == 0.0f ? 0.0f : src[i] * gain;
+            peak = std::max(peak, std::fabs(sample));
+            if (sum_into_bus)
+                dst[i] += sample;
+            else
+                dst[i] = sample;
+        }
     }
+    last_block_peak.store(peak, std::memory_order_relaxed);
     auto midiOut = plugin->getMainEventPortIndex(AAP_PORT_DIRECTION_OUTPUT);
     if (midiOut >= 0) {
         size_t midiSize = std::min(aapBuffer->get_buffer_size(aapBuffer, midiOut),
@@ -149,15 +180,23 @@ void aap::AudioPluginNode::processAudio(AudioBuffer *audioData, int32_t numFrame
 }
 
 void aap::AudioPluginNode::start() {
-    if (plugin->getInstanceState() == aap::PluginInstantiationState::PLUGIN_INSTANTIATION_STATE_UNPREPARED)
+    ControlScope control{*this};
+    if (!plugin)
+        return;
+    if (plugin->getInstanceState() == PLUGIN_INSTANTIATION_STATE_UNPREPARED)
         plugin->prepare(graph->getFramesPerCallback(), graph->getSampleRate());
-    plugin->activate();
+    if (plugin->getInstanceState() == PLUGIN_INSTANTIATION_STATE_INACTIVE)
+        plugin->activate();
 }
 
 void aap::AudioPluginNode::pause() {
-    plugin->deactivate();
+    ControlScope control{*this};
+    if (plugin && plugin->getInstanceState() == PLUGIN_INSTANTIATION_STATE_ACTIVE)
+        plugin->deactivate();
+    last_block_peak.store(0.0f, std::memory_order_relaxed);
 }
 
 void aap::AudioPluginNode::setPresetIndex(int32_t index) {
-    plugin->getStandardExtensions().setCurrentPresetIndex(index);
+    if (plugin)
+        plugin->getStandardExtensions().setCurrentPresetIndex(index);
 }

@@ -8,15 +8,26 @@ Java_org_androidaudioplugin_manager_PluginPlayer_loadAudioResourceNative(JNIEnv 
                                                                          jlong player,
                                                                          jbyteArray bytes,
                                                                          jstring filename) {
-    jboolean isDataCopy{false};
-    auto data = (uint8_t*) env->GetByteArrayElements(bytes, &isDataCopy);
-    jboolean isNameCopy{false};
-    auto name = env->GetStringUTFChars(filename, &isNameCopy);
-    ((aap::PluginPlayer*) player)->setAudioSource(data, env->GetArrayLength(bytes), name);
-    if (isNameCopy)
-        free((void*) name);
-    if (isDataCopy)
-        free((void*) data);
+    if (!player || !bytes || !filename)
+        return;
+    auto length = env->GetArrayLength(bytes);
+    if (length <= 0 || length > 64 * 1024 * 1024)
+        return;
+    auto data = env->GetByteArrayElements(bytes, nullptr);
+    if (!data)
+        return;
+    auto name = env->GetStringUTFChars(filename, nullptr);
+    if (!name) {
+        env->ReleaseByteArrayElements(bytes, data, JNI_ABORT);
+        return;
+    }
+    try {
+        ((aap::PluginPlayer*) player)->setAudioSource((uint8_t*) data, length, name);
+    } catch (...) {
+        // Loading failures leave the previous source intact.
+    }
+    env->ReleaseStringUTFChars(filename, name);
+    env->ReleaseByteArrayElements(bytes, data, JNI_ABORT);
 }
 
 extern "C"
@@ -25,12 +36,22 @@ Java_org_androidaudioplugin_manager_PluginPlayer_addMidiEventsNative(JNIEnv *env
                                                                      jlong player, jbyteArray bytes,
                                                                      jint offset, jint length,
                                                                      jlong timestampInNanoseconds) {
-    jboolean isDataCopy{false};
-    auto data = (uint8_t*) env->GetByteArrayElements(bytes, &isDataCopy);
+    if (!player || !bytes)
+        return;
+    auto size = env->GetArrayLength(bytes);
+    if (offset < 0 || length < 0 || offset > size || length > size - offset)
+        return;
+    auto data = env->GetByteArrayElements(bytes, nullptr);
+    if (!data)
+        return;
     // timeout would not be reliable from non-RT language environment though...
-    ((aap::PluginPlayer*) player)->addMidiEvents(data + offset, length, timestampInNanoseconds);
-    if (isDataCopy)
-        free((void*) data);
+    try {
+        ((aap::PluginPlayer*) player)->addMidiEvents((uint8_t*) data + offset, length, timestampInNanoseconds);
+    } catch (...) {
+        env->ReleaseByteArrayElements(bytes, data, JNI_ABORT);
+        return;
+    }
+    env->ReleaseByteArrayElements(bytes, data, JNI_ABORT);
 }
 
 extern "C"
@@ -106,6 +127,79 @@ Java_org_androidaudioplugin_manager_PluginPlayer_addPluginToSumBusNative(JNIEnv 
 
 extern "C"
 JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_addMasterEffectNative(JNIEnv *, jobject,
+                                                                      jlong player, jlong nativeClient,
+                                                                      jint instanceId) {
+    if (!player || !nativeClient)
+        return;
+    auto client = (aap::PluginClient*) nativeClient;
+    auto instance = client->getInstanceById(instanceId);
+    ((aap::PluginPlayer*) player)->getGraph().addMasterEffect((aap::RemotePluginInstance*) instance);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_setMasterGainNative(JNIEnv *, jobject,
+                                                                    jlong player, jfloat gain) {
+    if (player)
+        ((aap::PluginPlayer*) player)->getGraph().setMasterGain(gain);
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_addAudioTrackNative(JNIEnv *, jobject, jlong player) {
+    return player ? ((aap::PluginPlayer*) player)->getGraph().addAudioTrack() : -1;
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_loadAudioTrackNative(JNIEnv* env, jobject,
+                                                                     jlong player, jint trackId,
+                                                                     jbyteArray bytes, jstring filename) {
+    if (!player || !bytes || !filename)
+        return JNI_FALSE;
+    auto length = env->GetArrayLength(bytes);
+    // Reject oversized input before JNI may allocate a copy of the byte array.
+    if (length <= 0 || length > 64 * 1024 * 1024)
+        return JNI_FALSE;
+    auto data = env->GetByteArrayElements(bytes, nullptr);
+    if (!data)
+        return JNI_FALSE;
+    auto name = env->GetStringUTFChars(filename, nullptr);
+    if (!name) {
+        env->ReleaseByteArrayElements(bytes, data, JNI_ABORT);
+        return JNI_FALSE;
+    }
+    bool loaded = false;
+    try {
+        loaded = ((aap::PluginPlayer*) player)->getGraph().loadAudioTrack(
+                trackId, (uint8_t*) data, length, name);
+    } catch (...) {
+        // Do not allow native decoding/control failures to escape through JNI.
+    }
+    env->ReleaseStringUTFChars(filename, name);
+    env->ReleaseByteArrayElements(bytes, data, JNI_ABORT);
+    return loaded ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_setAudioTrackGainNative(JNIEnv *, jobject,
+                                                                       jlong player, jint trackId,
+                                                                       jfloat gain) {
+    if (player)
+        ((aap::PluginPlayer*) player)->getGraph().setAudioTrackGain(trackId, gain);
+}
+
+extern "C"
+JNIEXPORT jfloat JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_getAudioTrackPeakNative(JNIEnv *, jobject,
+                                                                       jlong player, jint trackId) {
+    return player ? ((aap::PluginPlayer*) player)->getGraph().getAudioTrackPeak(trackId) : 0.0f;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
 Java_org_androidaudioplugin_manager_PluginPlayer_setPluginMidiGroupsNative(JNIEnv *env, jobject thiz,
                                                                           jlong player, jlong nativeClient,
                                                                           jint instanceId, jint groupMask) {
@@ -113,6 +207,28 @@ Java_org_androidaudioplugin_manager_PluginPlayer_setPluginMidiGroupsNative(JNIEn
     auto instance = client->getInstanceById(instanceId);
     ((aap::PluginPlayer*) player)->getGraph().setPluginMidiGroups(
             (aap::RemotePluginInstance*) instance, (uint32_t) groupMask);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_setPluginGainNative(JNIEnv *, jobject,
+                                                                     jlong player, jlong nativeClient,
+                                                                     jint instanceId, jfloat gain) {
+    auto client = (aap::PluginClient*) nativeClient;
+    auto instance = client->getInstanceById(instanceId);
+    ((aap::PluginPlayer*) player)->getGraph().setPluginGain(
+            (aap::RemotePluginInstance*) instance, gain);
+}
+
+extern "C"
+JNIEXPORT jfloat JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_getPluginPeakNative(JNIEnv *, jobject,
+                                                                     jlong player, jlong nativeClient,
+                                                                     jint instanceId) {
+    auto client = (aap::PluginClient*) nativeClient;
+    auto instance = client->getInstanceById(instanceId);
+    return ((aap::PluginPlayer*) player)->getGraph().getPluginPeak(
+            (aap::RemotePluginInstance*) instance);
 }
 
 extern "C"
@@ -124,6 +240,13 @@ Java_org_androidaudioplugin_manager_PluginPlayer_getPeakLevelsNative(JNIEnv *env
     auto result = env->NewFloatArray(2);
     env->SetFloatArrayRegion(result, 0, 2, levels);
     return result;
+}
+
+extern "C"
+JNIEXPORT jlong JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_getTransportFramesNative(JNIEnv *, jobject,
+                                                                          jlong player) {
+    return ((aap::PluginPlayer*) player)->getGraph().getProcessedFrames();
 }
 
 extern "C"

@@ -4,6 +4,24 @@ plugins {
 
 apply { from ("../../common.gradle") }
 
+val oboeJniLibsDir = layout.buildDirectory.dir("generated/oboeJniLibs").get().asFile
+val unpackOboe = tasks.register<Copy>("unpackOboe") {
+    from(zipTree(configurations.detachedConfiguration(
+        dependencies.create("com.google.oboe:oboe:${libs.versions.oboe.get()}")).singleFile))
+    include("prefab/modules/oboe/libs/android.*/liboboe.so")
+    eachFile {
+        relativePath = RelativePath(true, relativePath.segments[4].removePrefix("android."), file.name)
+    }
+    includeEmptyDirs = false
+    into(oboeJniLibsDir)
+}
+
+androidComponents {
+    onVariants { variant ->
+        variant.sources.jniLibs?.addGeneratedSourceDirectory(unpackOboe, Copy::getDestinationDirectory)
+    }
+}
+
 android {
     namespace = "org.androidaudioplugin.aapinstrumentsample"
     defaultConfig {
