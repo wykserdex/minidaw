@@ -1,0 +1,50 @@
+#ifndef AAP_CORE_INSTANCE_REALTIME_STATE_H
+#define AAP_CORE_INSTANCE_REALTIME_STATE_H
+
+#include "realtime-byte-queue.h"
+#include "instance-extension-worker.h"
+#include "processing-quiescence.h"
+#include "recipient-aapxs.h"
+#include "legacy-aapxs-sender.h"
+#include "aap/core/aap_midi2_helper.h"
+#include "aap/ext/midi.h"
+#include "deferred-midi-input.h"
+
+namespace aap::internal {
+class AsyncParameterLayout;
+struct HostNotification {
+    char uri[AAP_MIDI2_AAPXS_DATA_MAX_SIZE];
+    int32_t opcode;
+    uint32_t request_id;
+};
+struct InstanceRealtimeState {
+    explicit InstanceRealtimeState(size_t midiCapacity)
+        : ump_input(midiCapacity), ump_output(midiCapacity), gui_output(midiCapacity) {}
+    // Whole validated AAPXS messages only, not borrowed audio/MIDI port buffers.
+    RealtimeByteQueue<64> aapxs_input{2 * AAP_MIDI2_AAPXS_DATA_MAX_SIZE + sizeof(AAPMidiBufferHeader)};
+    RealtimeByteQueue<64> ump_input, ump_output, gui_output;
+    RealtimeByteQueue<64> host_notifications{sizeof(HostNotification)};
+    std::array<std::atomic<uint32_t>, 256> coalesced_notifications{};
+    std::atomic<bool> process_notification{false};
+    std::atomic<bool> layout_refresh{false};
+    std::shared_ptr<AsyncParameterLayout> layout_scan; // extension worker only
+    InstanceExtensionWorker worker;
+    RecipientRequestStore recipient_requests;
+    LegacyAAPXSSender legacy_sender;
+    ProcessingQuiescence processing;
+    std::vector<std::unique_ptr<DeferredMidiInput>> deferred_midi; // indexed by port, DSP only
+    std::atomic<bool> reset_deferred_midi{false}; // lifecycle requests, applied by DSP
+    std::atomic<bool> extension_state_ready{false};
+    std::mutex gui_read_mutex; // GUI consumers only; processing only publishes
+    size_t gui_read_offset{0};
+    std::mutex parameter_scan_mutex; // control/worker scans of this instance only
+};
+
+inline void queueAAPXSMidi2Input(void* context, const void* data, size_t size) {
+    auto& state = *static_cast<InstanceRealtimeState*>(context);
+    AAPMidiBufferHeader header{};
+    header.length = static_cast<uint32_t>(size);
+    if (state.aapxs_input.tryPush(data, size, &header, sizeof(header))) state.worker.notify();
+}
+}
+#endif

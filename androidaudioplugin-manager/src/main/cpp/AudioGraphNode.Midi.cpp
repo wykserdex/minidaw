@@ -1,0 +1,173 @@
+#include "AudioGraph.h"
+#include <aap/unstable/logging.h>
+
+#define LOG_TAG "AAP.AudioGraph.Midi"
+
+aap::MidiSourceNode::MidiSourceNode(AudioGraph* ownerGraph,
+                                    RemotePluginInstance* instance,
+                                    int32_t sampleRate,
+                                    int32_t audioNumFramesPerCallback,
+                                    int32_t initialMidiProtocol,
+                                    int32_t internalBufferSize) :
+        AudioGraphNode(ownerGraph),
+        capacity(internalBufferSize),
+        translator(instance, internalBufferSize, initialMidiProtocol),
+        sample_rate(sampleRate),
+        aap_frame_size(audioNumFramesPerCallback) {
+    buffer = (uint8_t*) calloc(1, internalBufferSize);
+}
+
+aap::MidiSourceNode::~MidiSourceNode() {
+    if (buffer)
+        free(buffer);
+}
+
+void aap::MidiSourceNode::processAudio(AudioBuffer *audioData, int32_t numFrames) {
+    clock_gettime(CLOCK_REALTIME, &last_aap_process_time);
+    auto dstBuffer = (AAPMidiBufferHeader*) audioData->midi_in;
+    // MIDI event might be being added, so we wait a bit using "almost-spin" lock (uses nano-sleep).
+    if (std::unique_lock<NanoSleepLock> tryLock(midi_buffer_mutex, std::try_to_lock); tryLock.owns_lock()) {
+        auto srcBuffer = (AAPMidiBufferHeader*) buffer;
+        if (srcBuffer->length)
+            memcpy(dstBuffer, srcBuffer, sizeof(AAPMidiBufferHeader) + srcBuffer->length);
+        srcBuffer->length = 0;
+    } else {
+        // failed to acquire lock; we do not send anything this time.
+        dstBuffer->length = 0;
+    }
+}
+
+void aap::MidiSourceNode::addMidiEvent(uint8_t *bytes, int32_t length, int64_t timestampInNanoseconds) {
+
+    // This function is invoked every time Kotlin PluginPlayer.addMidiEvent() is invoked, immediately.
+    // On the other hand, AAPs don't process MIDI events immediately (it is handled at `process()`),
+    // so we have to buffer them and flush them to the instrument plugin every time process() is invoked.
+    //
+    // Since we don't really know when it is actually processed but have to accurately
+    // pass delta time for each input events, we assign event timecode from
+    // 1) argument timestampInNanoseconds and 2) actual time passed from previous call to
+    // this function.
+    int64_t actualTimestamp = timestampInNanoseconds;
+    struct timespec curtime{};
+    clock_gettime(CLOCK_REALTIME, &curtime);
+
+    // it is 99.999... percent true since audio loop must have started before any MIDI events...
+    if (last_aap_process_time.tv_sec > 0) {
+        int64_t diff = (curtime.tv_sec - last_aap_process_time.tv_sec) * 1000000000 +
+                       curtime.tv_nsec - last_aap_process_time.tv_nsec;
+        auto nanosecondsPerCycle = (int64_t) (1.0 * aap_frame_size / sample_rate * 1000000000);
+        actualTimestamp = (timestampInNanoseconds + diff) % nanosecondsPerCycle;
+    }
+
+    // apply translation at this step (every time event is added, non-RT processing, unlocked)
+    size_t translatedLength = translator.translateMidiEvent(bytes, length);
+    auto actualData = translatedLength > 0 ? translator.getTranslationBuffer() : bytes;
+    auto actualLength = translatedLength > 0 ? translatedLength : length;
+
+    // update MIDI input buffer with lock
+    { // lock scope
+        auto dst8 = (uint8_t *) buffer;
+        auto dstMBH = (AAPMidiBufferHeader *) dst8;
+        const std::lock_guard <NanoSleepLock> lock{midi_buffer_mutex};
+
+        if (dst8 != nullptr) {
+            uint32_t savedOffset = dstMBH->length;
+            uint32_t currentOffset = savedOffset;
+            int32_t tIter = 0;
+            auto headerSize = sizeof(AAPMidiBufferHeader);
+            auto totalTicks = actualTimestamp / (1000000000 / 31250);
+            auto jrTimestampCount = totalTicks > 0 ? static_cast<uint32_t>((totalTicks - 1) / 31250 + 1) : 0;
+            auto requiredBytes = headerSize + currentOffset + jrTimestampCount * static_cast<uint32_t>(sizeof(uint32_t)) + static_cast<uint32_t>(actualLength);
+            if (requiredBytes > static_cast<uint32_t>(capacity)) {
+                aap::a_log_f(AAP_LOG_LEVEL_WARN, LOG_TAG,
+                             "Dropping %d-byte MIDI event at %lld ns due to input buffer overflow (%u > %d)",
+                             static_cast<int32_t>(actualLength),
+                             static_cast<long long>(actualTimestamp),
+                             requiredBytes,
+                             capacity);
+                return;
+            }
+
+            for (int64_t ticks = actualTimestamp / (1000000000 / 31250);
+                 ticks > 0; ticks -= 31250, tIter++) {
+                *(int32_t * )(dst8 + headerSize + currentOffset + tIter * 4) =
+                        (int32_t) cmidi2_ump_jr_timestamp_direct(ticks > 31250 ? 31250 : ticks);
+            }
+            currentOffset += tIter * 4;
+            memcpy(dst8 + headerSize + currentOffset, actualData, actualLength);
+            currentOffset += actualLength;
+
+            if (savedOffset != dstMBH->length) {
+                // updated
+                memcpy(dst8 + headerSize, dst8 + headerSize + savedOffset, actualLength);
+                dstMBH->length = currentOffset - savedOffset;
+            } else
+                dstMBH->length = currentOffset;
+        }
+    }
+}
+
+
+void aap::MidiSourceNode::start() {
+}
+
+void aap::MidiSourceNode::pause() {
+
+}
+
+//--------
+
+aap::MidiDestinationNode::MidiDestinationNode(AudioGraph* ownerGraph, int32_t internalBufferSize) :
+        AudioGraphNode(ownerGraph),
+        capacity(internalBufferSize) {
+    buffer = (uint8_t*) calloc(1, internalBufferSize);
+}
+
+aap::MidiDestinationNode::~MidiDestinationNode() {
+    if (buffer)
+        free(buffer);
+}
+
+void aap::MidiDestinationNode::processAudio(AudioBuffer *audioData, int32_t numFrames) {
+    // MIDI event might be being consumed, so we wait a bit using "almost-spin" lock (uses nano-sleep).
+    if (std::unique_lock<NanoSleepLock> tryLock(midi_buffer_mutex, std::try_to_lock); tryLock.owns_lock()) {
+        auto srcBuffer = (AAPMidiBufferHeader*) audioData->midi_out;
+        auto dstBuffer = (AAPMidiBufferHeader*) buffer;
+        if (srcBuffer->length) {
+            auto appendable = std::min<int32_t>(srcBuffer->length, capacity - static_cast<int32_t>(sizeof(AAPMidiBufferHeader)) - static_cast<int32_t>(dstBuffer->length));
+            if (appendable > 0) {
+                memcpy((uint8_t*) (dstBuffer + 1) + dstBuffer->length, srcBuffer + 1, appendable);
+                dstBuffer->length += appendable;
+            }
+        }
+        srcBuffer->length = 0;
+    } else {
+        // failed to acquire lock; we skip copying and keep source length.
+    }
+}
+
+int32_t aap::MidiDestinationNode::readMidiEvents(uint8_t* dst, int32_t dstCapacity) {
+    if (!dst || dstCapacity <= 0)
+        return 0;
+    if (std::unique_lock<NanoSleepLock> tryLock(midi_buffer_mutex, std::try_to_lock); tryLock.owns_lock()) {
+        auto srcBuffer = (AAPMidiBufferHeader*) buffer;
+        auto bytesToRead = std::min<int32_t>(srcBuffer->length, dstCapacity);
+        if (bytesToRead <= 0)
+            return 0;
+        memcpy(dst, srcBuffer + 1, bytesToRead);
+        auto remaining = static_cast<int32_t>(srcBuffer->length) - bytesToRead;
+        if (remaining > 0)
+            memmove(srcBuffer + 1, (uint8_t*) (srcBuffer + 1) + bytesToRead, remaining);
+        srcBuffer->length = remaining;
+        return bytesToRead;
+    }
+    return 0;
+}
+
+void aap::MidiDestinationNode::start() {
+
+}
+
+void aap::MidiDestinationNode::pause() {
+
+}

@@ -1,0 +1,158 @@
+
+#ifndef AAP_MIDI_DEVICE_SERVICE_AAPMIDIPROCESSOR_H
+#define AAP_MIDI_DEVICE_SERVICE_AAPMIDIPROCESSOR_H
+
+#include <functional>
+#include <vector>
+#include <zix/ring.h>
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-variable"
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wunused-but-set-variable"
+#include <cmidi2.h>
+#pragma clang diagnostic pop
+#include <aap/core/host/audio-plugin-host.h>
+#include <aap/core/aapxs/extension-service.h>
+#include <aap/unstable/utility.h>
+#include "AAPMidiCISession.h"
+
+namespace aap::midi {
+    // keep it compatible with Oboe
+    enum AudioCallbackResult : int32_t {
+        Continue = 0,
+        Stop = 1
+    };
+
+    class AAPMidiProcessorPAL {
+    public:
+        // They are used to control callback-based audio output streaming.
+        virtual int32_t setupStream() = 0;
+        virtual int32_t startStreaming() = 0;
+        virtual int32_t stopStreaming() = 0;
+        // It is kind of raw MIDI input event listener (not a "handler" that overrides processing).
+        // The Android Stub implementation would override this to dump the messages to Android log.
+        virtual void midiInputReceived(uint8_t* bytes, size_t offset, size_t length, int64_t timestampInNanoseconds) {}
+    };
+
+    enum AudioDriverType {
+        AAP_MIDI_PROCESSOR_AUDIO_DRIVER_TYPE_OBOE,
+        AAP_MIDI_PROCESSOR_AUDIO_DRIVER_TYPE_STUB
+    };
+
+    enum AAPMidiProcessorState {
+        AAP_MIDI_PROCESSOR_STATE_CREATED,
+        AAP_MIDI_PROCESSOR_STATE_ACTIVE,
+        AAP_MIDI_PROCESSOR_STATE_INACTIVE,
+        AAP_MIDI_PROCESSOR_STATE_STOPPED,
+        AAP_MIDI_PROCESSOR_STATE_ERROR
+    };
+
+    enum AAPMidiTranslationType {
+        AAP_MIDI_TRANSLATION_TYPE_NONE,
+        AAP_MIDI_TRANSLATION_TYPE_1To2,
+        AAP_MIDI_TRANSLATION_TYPE_2To1
+    };
+
+    class PluginInstanceData {
+        std::vector<int> audio_out_ports{};
+
+    public:
+        PluginInstanceData(int instanceId, size_t numPorts) : instance_id(instanceId) {
+            auto arr = (void**) calloc(sizeof(void*), numPorts + 1);
+            arr[numPorts] = nullptr;
+        }
+        inline std::vector<int32_t>* getAudioOutPorts() { return &audio_out_ports; }
+
+        int instance_id;
+        int midi1_in_port{-1};
+        int midi2_in_port{-1};
+    };
+
+    class AAPMidiProcessor {
+        static std::string convertStateToText(AAPMidiProcessorState state);
+
+        // AAP
+        aap::PluginListSnapshot plugin_list{};
+        std::unique_ptr<aap::PluginClient> client{nullptr};
+        int32_t sample_rate{0};
+        int32_t aap_frame_size{1024};
+        int32_t midi_buffer_size{4096};
+        int32_t channel_count{2};
+        std::unique_ptr<PluginInstanceData> instance_data{nullptr};
+        int32_t instrument_instance_id{0};
+        // MIDI protocol type of the messages it receives via JNI
+        int32_t receiver_midi_protocol{CMIDI2_PROTOCOL_TYPE_MIDI1};
+        int32_t current_mapping_policy{AAP_PARAMETERS_MAPPING_POLICY_NONE};
+
+        int32_t getAAPMidiInputPortType();
+        PluginInstanceData* getAAPMidiInputData();
+        void* getAAPMidiInputBuffer();
+        // used when we need MIDI1<->UMP translation.
+        uint8_t* translation_buffer{nullptr};
+
+        // If needed, translate MIDI1 bytestream to MIDI2 UMP.
+        // returns 0 if translation did not happen. Otherwise return the size of translated buffer in translation_buffer.
+        size_t translateMidiBufferIfNeeded(uint8_t* bytes, size_t offset, size_t length);
+
+        // If needed, process MIDI mapping for parameters (CC/ACC/PNACC to sysex8) and presets (program).
+        // returns 0 if translation did not happen. Otherwise return the size of translated buffer in translation_buffer.
+        size_t runThroughMidi2UmpForMidiMapping(uint8_t* bytes, size_t offset, size_t length);
+
+        // MIDI-CI session (set up in activate() after plugin instantiation).
+        std::unique_ptr<AAPMidiCISession> ci_session{nullptr};
+        std::vector<uint32_t> ci_input_word_buffer{};
+        std::vector<uint8_t> ci_output_byte_buffer{};
+        void setupCISession();
+
+        // Called by the CI session to send CI response bytes back to the host.
+        // Set from JNI via setMidiOutputSender().
+        std::function<void(const uint8_t*, size_t, size_t, uint64_t)> midi_output_sender{};
+
+        // Outputs
+        ZixRing *aap_input_ring_buffer{nullptr};
+        float *interleave_buffer{nullptr};
+        struct timespec last_aap_process_time{0, 0};
+
+        NanoSleepLock midi_buffer_mutex{};
+        uint8_t midi_input_buffer[4096];
+
+    protected:
+        AAPMidiProcessorState state{AAP_MIDI_PROCESSOR_STATE_CREATED};
+        virtual AAPMidiProcessorPAL* pal() = 0;
+
+    public:
+        void initialize(aap::PluginClientConnectionList* connections,
+                        int32_t sampleRate, int32_t channelCount,
+                        int32_t aapFrameSize, int32_t midiBufferSize, int32_t midiMessageFormat);
+
+        void instantiatePlugin(std::string pluginId);
+
+        int32_t getInstrumentMidiMappingPolicy();
+
+        void activate();
+
+        void processMidiInput(uint8_t* bytes, size_t offset, size_t length, int64_t timestampInNanoseconds);
+
+        void callPluginProcess();
+
+        void fillAudioOutput();
+
+        void deactivate();
+
+        void terminate();
+
+        int32_t processAudioIO(void *audioData, int32_t numFrames);
+
+        inline int32_t getChannelCount() { return channel_count; }
+
+        inline int32_t getAAPFrameSize() { return aap_frame_size; }
+
+        // Register the callback used to write MIDI-CI response bytes back to
+        // the Android MIDI host (forwarded via JNI from Kotlin).
+        void setMidiOutputSender(std::function<void(const uint8_t*, size_t, size_t, uint64_t)> sender) {
+            midi_output_sender = std::move(sender);
+        }
+    };
+}
+
+#endif //AAP_MIDI_DEVICE_SERVICE_AAPMIDIPROCESSOR_H

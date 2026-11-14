@@ -1,0 +1,176 @@
+
+// As a principle, there must not be Android-specific references in this code.
+// Anything Android specific must to into `android` directory.
+#include <sys/stat.h>
+#if ANDROID
+#include <android/sharedmem.h>
+#endif
+#include <sys/mman.h>
+#include <vector>
+#include "aap/core/host/audio-plugin-host.h"
+#include "aap/unstable/logging.h"
+#include "aap/core/host/shared-memory-store.h"
+#include "plugin-service-list.h"
+#include "audio-plugin-host-internals.h"
+#include "aap/core/host/plugin-client-system.h"
+#include "aap/core/host/plugin-instance.h"
+#include "aap/core/AAPXSMidi2RecipientSession.h"
+#include "buffer-layout.h"
+#include <unistd.h>
+
+
+#define LOG_TAG "AAP.Host"
+
+namespace aap
+{
+
+std::unique_ptr<PluginServiceList> plugin_service_list{nullptr};
+
+PluginServiceList* PluginServiceList::getInstance() {
+	if (!plugin_service_list)
+		plugin_service_list = std::make_unique<PluginServiceList>();
+	return plugin_service_list.get();
+}
+
+//-----------------------------------
+
+bool AbstractPluginBuffer::initialize(int32_t numPorts, int32_t numFrames) {
+    if (buffers || buffer_sizes) {  // already allocated?
+        AAP_ASSERT_FALSE;
+        return false;
+    }
+
+	num_ports = numPorts;
+	num_frames = numFrames;
+	buffers = (void **) calloc(numPorts, sizeof(float *)); // this part is always local
+	if (!buffers)
+		return false;
+	buffer_sizes = (int32_t*) calloc(numPorts, sizeof(int32_t)); // this part is always local
+	if (!buffer_sizes)
+		return false;
+	return true;
+}
+
+//-----------------------------------
+
+int32_t ClientPluginSharedMemoryStore::allocateClientBuffer(size_t numPorts, size_t numFrames, aap::PluginInstance& instance, size_t defaultControllBytesPerBlock) {
+	memory_origin = PLUGIN_BUFFER_ORIGIN_LOCAL;
+
+	size_t commonMemSize = numFrames * sizeof(float);
+	port_buffer = std::make_unique<SharedMemoryPluginBuffer>(&instance);
+    if (!port_buffer) {
+        AAP_ASSERT_FALSE;
+        return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_FAILED_LOCAL_ALLOC;
+    }
+	port_buffer->initialize(numPorts, numFrames);
+
+	for (size_t i = 0; i < numPorts; i++) {
+		auto port = instance.getPort(i);
+		auto memSize = port->hasProperty(AAP_PORT_MINIMUM_SIZE) ? port->getPropertyAsInteger(AAP_PORT_MINIMUM_SIZE) :
+				port->getContentType() == AAP_CONTENT_TYPE_AUDIO ? commonMemSize : defaultControllBytesPerBlock;
+		int32_t fd = PluginClientSystem::getInstance()->createSharedMemory(memSize);
+		if (!fd)
+			return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_FAILED_SHM_CREATE;
+		port_buffer_fds->emplace_back(fd);
+		auto mapped = mmap(nullptr, memSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (!mapped)
+			return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_FAILED_MMAP;
+		port_buffer->setBuffer(i, mapped);
+		port_buffer->setBufferSize(i, memSize);
+	}
+	port_buffer->rebuildBusViews();
+
+	return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_SUCCESS;
+}
+
+int32_t ServicePluginSharedMemoryStore::allocateServiceBuffer(std::vector<int32_t>& clientFDs, size_t numFrames, aap::PluginInstance& instance, size_t defaultControllBytesPerBlock) {
+	memory_origin = PLUGIN_BUFFER_ORIGIN_REMOTE;
+
+	size_t numPorts = clientFDs.size();
+	size_t commonMemSize = numFrames * sizeof(float);
+	port_buffer = std::make_unique<SharedMemoryPluginBuffer>(&instance);
+    if (!port_buffer) {
+        AAP_ASSERT_FALSE;
+        return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_FAILED_LOCAL_ALLOC;
+    }
+	if (!port_buffer->initialize(numPorts, numFrames))
+		return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_FAILED_LOCAL_ALLOC;
+
+	for (size_t i = 0; i < numPorts; i++) {
+		auto port = instance.getPort(i);
+		auto memSize = port->hasProperty(AAP_PORT_MINIMUM_SIZE) ? port->getPropertyAsInteger(AAP_PORT_MINIMUM_SIZE) :
+					   port->getContentType() == AAP_CONTENT_TYPE_AUDIO ? commonMemSize : defaultControllBytesPerBlock;
+		int32_t fd = clientFDs[i];
+		if (!fd)
+			return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_FAILED_SHM_CREATE;
+#if ANDROID
+		// The host decides the buffer size (e.g. its MIDI2 buffer size), so follow the actual memory.
+		if (auto actualSize = ASharedMemory_getSize(fd); actualSize > 0)
+			memSize = actualSize;
+#endif
+		port_buffer_fds->emplace_back(fd);
+		auto mapped = mmap(nullptr, memSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (!mapped)
+			return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_FAILED_MMAP;
+        port_buffer->setBuffer(i, mapped);
+        port_buffer->setBufferSize(i, memSize);
+	}
+	port_buffer->rebuildBusViews();
+
+	return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_SUCCESS;
+}
+
+int32_t ClientPluginSharedMemoryStore::allocateClientBufferPool(const aap_buffer_layout_t& layout, aap::PluginInstance& instance) {
+	memory_origin = PLUGIN_BUFFER_ORIGIN_LOCAL;
+
+	auto newPool = std::make_unique<BufferPool>();
+	newPool->size = layout.pool_size;
+	newPool->fd = PluginClientSystem::getInstance()->createSharedMemory(layout.pool_size);
+	if (newPool->fd <= 0)
+		return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_FAILED_SHM_CREATE;
+	auto mapped = mmap(nullptr, newPool->size, PROT_READ | PROT_WRITE, MAP_SHARED, newPool->fd, 0);
+	if (mapped == MAP_FAILED)
+		return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_FAILED_MMAP;
+	newPool->mapping = mapped;
+	auto buffer = createPoolBuffer(layout, mapped, instance);
+	if (!buffer)
+		return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_FAILED_LOCAL_ALLOC;
+	installBufferPool(std::move(newPool), std::move(buffer));
+	return PluginMemoryAllocatorResult::PLUGIN_MEMORY_ALLOCATOR_SUCCESS;
+}
+
+std::string ServicePluginSharedMemoryStore::completeServicePoolInitialization(const aap_buffer_layout_t& layout, int32_t frameCount, aap::PluginInstance& instance) {
+	memory_origin = PLUGIN_BUFFER_ORIGIN_REMOTE;
+
+	auto fds = std::move(*cached_shm_fds_for_prepare);
+	cached_shm_fds_for_prepare->clear();
+	if (fds.size() != 1 || fds[0] <= 0) {
+		for (auto fd : fds)
+			if (fd > 0)
+				close(fd);
+		return "the buffer pool was not passed";
+	}
+	auto newPool = std::make_unique<BufferPool>();
+	newPool->fd = fds[0]; // already duplicated by prepareMemory(); the pool closes it.
+	struct stat st{};
+	size_t actualSize = fstat(newPool->fd, &st) == 0 ? (size_t) st.st_size : 0;
+#if ANDROID
+	if (auto ashmemSize = ASharedMemory_getSize(newPool->fd); ashmemSize > 0)
+		actualSize = ashmemSize;
+#endif
+	auto error = internal::validateBufferLayout(layout, instance, frameCount, actualSize);
+	if (!error.empty())
+		return error;
+	newPool->size = layout.pool_size;
+	auto mapped = mmap(nullptr, newPool->size, PROT_READ | PROT_WRITE, MAP_SHARED, newPool->fd, 0);
+	if (mapped == MAP_FAILED)
+		return "failed to map the buffer pool";
+	newPool->mapping = mapped;
+	auto buffer = createPoolBuffer(layout, mapped, instance);
+	if (!buffer)
+		return "failed to allocate the pool buffer";
+	installBufferPool(std::move(newPool), std::move(buffer));
+	return {};
+}
+
+} // namespace

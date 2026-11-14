@@ -1,0 +1,111 @@
+
+#include <aap/core/host/plugin-client-system.h>
+#include <aap/core/host/plugin-host.h>
+#include <aap/core/host/plugin-instance.h>
+#include "audio-plugin-host-internals.h"
+#include "plugin-parameter-state.h"
+
+#define LOG_TAG "AAP.PluginHost.Client"
+
+const aap::PluginInformation* aap::PluginClient::findPluginInformation(const std::string& identifier) {
+    plugin_list->refreshIfStale();
+    auto descriptor = plugin_list->getPluginInformation(identifier);
+    if (descriptor == nullptr) {
+        // The package change notification may not have arrived yet (it is delivered asynchronously,
+        // and deferred while the host app is cached), so re-query once before giving up.
+        plugin_list->refresh();
+        descriptor = plugin_list->getPluginInformation(identifier);
+    }
+    return descriptor;
+}
+
+void aap::PluginClient::connectToPluginService(const std::string& identifier, std::function<void(std::string&)> callback) {
+    const PluginInformation *descriptor = findPluginInformation(identifier);
+    if (descriptor == nullptr) {
+        std::string error{std::string{"plugin not found: "} + identifier};
+        aap::a_log(AAP_LOG_LEVEL_ERROR, LOG_TAG, error.c_str());
+        callback(error);
+        return;
+    }
+    connectToPluginService(descriptor->getPluginPackageName(), descriptor->getPluginLocalName(), callback);
+}
+void aap::PluginClient::connectToPluginService(const std::string& packageName, const std::string& className, std::function<void(std::string&)> callback) {
+    auto service = connections->getServiceHandleForConnectedPlugin(packageName, className);
+    if (service != nullptr) {
+        std::string error{};
+        callback(error);
+    } else {
+        PluginClientSystem::getInstance()->ensurePluginServiceConnected(connections, packageName, callback);
+    }
+}
+
+aap::PluginClient::Result<int32_t> aap::PluginClient::createInstance(std::string identifier, bool isRemoteExplicit)
+{
+    Result<int32_t> result;
+    const PluginInformation *descriptor = findPluginInformation(identifier);
+    if (descriptor == nullptr)
+        return Result<int32_t>{-1, std::string{"plugin not found: "} + identifier};
+
+    // For local plugins, they can be directly loaded using dlopen/dlsym.
+    // For remote plugins, the connection has to be established through binder.
+    auto internalCallback = [=](PluginInstance* instance, std::string error) {
+        if (instance != nullptr) {
+            return Result<int32_t>{instance->getInstanceId(), ""};
+        }
+        else
+            return Result<int32_t>{-1, error};
+    };
+    if (isRemoteExplicit || descriptor->isOutProcess())
+        return instantiateRemotePlugin(descriptor);
+    else {
+        try {
+            auto instance = instantiateLocalPlugin(descriptor);
+            return internalCallback(instance, "");
+        } catch(std::exception& ex) {
+            return internalCallback(nullptr, ex.what());
+        }
+    }
+}
+
+aap::PluginClient::Result<int32_t> aap::PluginClient::instantiateRemotePlugin(const PluginInformation *descriptor)
+{
+    // We first ensure to bind the remote plugin service, and then create a plugin instance.
+    //  Since binding the plugin service must be asynchronous while instancing does not have to be,
+    //  we call ensureServiceConnected() first and pass the rest as its callback.
+    auto internalCallback = [this,descriptor](std::string error) {
+        if (error.empty()) {
+#if ANDROID
+            auto pluginFactory = GetAndroidAudioPluginFactoryClientBridge(this);
+#else
+            auto pluginFactory = GetDesktopAudioPluginFactoryClientBridge(this);
+#endif
+            if (pluginFactory == nullptr) {
+                AAP_ASSERT_FALSE;
+                return Result<int32_t>{-1, std::string{"pluginFactory is not returned as expected"}};
+            }
+            auto instance = new RemotePluginInstance(this,
+                                        aapxs_definition_registry,
+                                                     descriptor, pluginFactory,
+                                                     event_midi2_input_buffer_size);
+            instances.emplace_back(instance);
+            instance->setupAAPXS(); // this needs to be done before setupAAPXSInstances() which is invoked by completeInstantiation() in binder-client-as-plugin.
+            instance->completeInstantiation();
+            if (!instance->getPlugin()) {
+                destroyInstance(instance);
+                return Result<int32_t>{-1, "Plugin service disconnected or instance creation failed: " + descriptor->getPluginID()};
+            }
+            instance->configurePorts();
+            instance->scanParametersAndBuildList();
+            internal::handleParameterLayoutChanged(*instance);
+
+            return Result<int32_t>{instance->getInstanceId(), ""};
+        }
+        else
+            return Result<int32_t>{-1, error};
+    };
+    auto service = connections->getServiceHandleForConnectedPlugin(descriptor->getPluginPackageName(), descriptor->getPluginLocalName());
+    if (service != nullptr)
+        return internalCallback("");
+    else
+        return internalCallback(std::string{"Plugin service is not started yet: "} + descriptor->getPluginID());
+}

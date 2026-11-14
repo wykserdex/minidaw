@@ -1,0 +1,188 @@
+#ifndef AAP_CORE_PARAMETERS_AAPXS_H
+#define AAP_CORE_PARAMETERS_AAPXS_H
+
+#include <functional>
+#include <future>
+#include "aap/aapxs.h"
+#include "../../ext/parameters.h"
+#include "typed-aapxs.h"
+
+// plugin extension opcodes
+const int32_t OPCODE_PARAMETERS_GET_PARAMETER_COUNT = 1;
+const int32_t OPCODE_PARAMETERS_GET_PARAMETER = 2;
+const int32_t OPCODE_PARAMETERS_GET_PROPERTY = 3;
+const int32_t OPCODE_PARAMETERS_GET_ENUMERATION_COUNT = 4;
+const int32_t OPCODE_PARAMETERS_GET_ENUMERATION = 5;
+
+// host extension opcodes
+const int32_t OPCODE_NOTIFY_PARAMETERS_CHANGED = -1;
+
+const int32_t PARAMETERS_SHARED_MEMORY_SIZE = sizeof(aap_parameter_info_t); // it is the expected max size in v2.1 extension.
+
+namespace aap::xs {
+    class ParametersClientAAPXS : public TypedAAPXS {
+        // extension proxy support
+        static int32_t staticGetParameterCount(aap_parameters_extension_t* ext, AndroidAudioPlugin* plugin) {
+            return ((ParametersClientAAPXS*) ext->aapxs_context)->getParameterCount();
+        }
+        static aap_parameter_info_t staticGetParameter(aap_parameters_extension_t* ext, AndroidAudioPlugin* plugin, int32_t index) {
+            return ((ParametersClientAAPXS*) ext->aapxs_context)->getParameter(index);
+        }
+        static double staticGetProperty(aap_parameters_extension_t* ext, AndroidAudioPlugin* plugin, int32_t index, int32_t propertyId) {
+            return ((ParametersClientAAPXS*) ext->aapxs_context)->getProperty(index, propertyId);
+        }
+        static int32_t staticGetEnumerationCount(aap_parameters_extension_t* ext, AndroidAudioPlugin* plugin, int32_t index) {
+            return ((ParametersClientAAPXS*) ext->aapxs_context)->getEnumerationCount(index);
+        }
+        static aap_parameter_enum_t staticGetEnumeration(aap_parameters_extension_t* ext, AndroidAudioPlugin* plugin, int32_t index, int32_t enumIndex) {
+            return ((ParametersClientAAPXS*) ext->aapxs_context)->getEnumeration(index, enumIndex);
+        }
+        aap_parameters_extension_t as_plugin_extension{this,
+                                                       staticGetParameterCount,
+                                                       staticGetParameter,
+                                                       staticGetProperty,
+                                                       staticGetEnumerationCount,
+                                                       staticGetEnumeration};
+
+    public:
+        // Non-realtime callbacks: result.error distinguishes failure from valid default data.
+        using ParameterCallback = void (*)(ParametersClientAAPXS*, void* pluginOrHost,
+                                           int32_t index, Result<aap_parameter_info_t> result);
+        using EnumerationCallback = void (*)(ParametersClientAAPXS*, void* pluginOrHost,
+                                             int32_t index, int32_t enumIndex,
+                                             Result<aap_parameter_enum_t> result);
+
+        ParametersClientAAPXS(AAPXSInitiatorInstance* initiatorInstance, AAPXSSerializationContext* serialization)
+                : TypedAAPXS(AAP_PARAMETERS_EXTENSION_URI, initiatorInstance, serialization) {
+        }
+
+        int32_t getParameterCount();
+        aap_parameter_info_t getParameter(int32_t index);
+        double getProperty(int32_t index, int32_t propertyId);
+        int32_t getEnumerationCount(int32_t index);
+        aap_parameter_enum_t getEnumeration(int32_t index, int32_t enumIndex);
+
+        // returns request ID
+        int32_t getParameterAsync(int32_t index, ParameterCallback callback);
+        // returns request ID
+        int32_t getEnumerationAsync(int32_t index, int32_t enumIndex, EnumerationCallback callback);
+
+        aap_parameters_extension_t* asPluginExtension() { return &as_plugin_extension; }
+
+    };
+
+    class ParametersServiceAAPXS : public TypedAAPXS {
+        // extension proxy support
+        static void staticNotifyParametersChanged(aap_parameters_host_extension_t* ext, AndroidAudioPluginHost* host) {
+            ((ParametersServiceAAPXS*) ext->aapxs_context)->notifyParametersChanged();
+        }
+        aap_parameters_host_extension_t host_extension{this, staticNotifyParametersChanged};
+
+    public:
+        ParametersServiceAAPXS(AAPXSInitiatorInstance* initiatorInstance, AAPXSSerializationContext* serialization)
+                : TypedAAPXS(AAP_PARAMETERS_EXTENSION_URI, initiatorInstance, serialization) {
+        }
+
+        void notifyParametersChanged();
+
+        aap_parameters_host_extension_t* asHostExtension() { return &host_extension; }
+    };
+
+    class AAPXSDefinition_Parameters : public AAPXSDefinitionWrapper {
+        static void aapxs_parameters_process_incoming_plugin_aapxs_request(
+                struct AAPXSDefinition* feature,
+                AAPXSRecipientInstance* aapxsInstance,
+                AndroidAudioPlugin* plugin,
+                AAPXSRequestContext* request);
+        static void aapxs_parameters_process_incoming_host_aapxs_request(
+                struct AAPXSDefinition* feature,
+                AAPXSRecipientInstance* aapxsInstance,
+                AndroidAudioPluginHost* host,
+                AAPXSRequestContext* request);
+        static void aapxs_parameters_process_incoming_plugin_aapxs_reply(
+                struct AAPXSDefinition* feature,
+                AAPXSInitiatorInstance* aapxsInstance,
+                AndroidAudioPlugin* plugin,
+                AAPXSRequestContext* request);
+        static void aapxs_parameters_process_incoming_host_aapxs_reply(
+                struct AAPXSDefinition* feature,
+                AAPXSInitiatorInstance* aapxsInstance,
+                AndroidAudioPluginHost* host,
+                AAPXSRequestContext* request);
+
+        // It is used in synchronous context such as `get_extension()` in `binder-client-as-plugin.cpp` etc.
+        static AAPXSExtensionClientProxy aapxs_parameters_get_plugin_proxy(
+                struct AAPXSDefinition* feature,
+                AAPXSInitiatorInstance* aapxsInstance,
+                AAPXSSerializationContext* serialization);
+
+        static AAPXSExtensionServiceProxy aapxs_parameters_get_host_proxy(
+                struct AAPXSDefinition *feature,
+                AAPXSInitiatorInstance *aapxsInstance,
+                AAPXSSerializationContext *serialization);
+
+        static void aapxs_parameters_outgoing_host_request(AAPXSDefinition*, AAPXSInitiatorInstance*, AAPXSRequestContext*);
+        static uint32_t aapxs_parameters_request_flags(AAPXSDefinition*, bool, int32_t);
+        static void aapxs_parameters_state_changed(AAPXSDefinition*, AAPXSRecipientInstance*, AndroidAudioPlugin*);
+        static void aapxs_parameters_release_plugin_context(AAPXSDefinition*, void*);
+        static bool aapxs_parameters_initialize_recipient(AAPXSDefinition*, AAPXSRecipientInstance*, bool host);
+        static void aapxs_parameters_release_recipient(AAPXSDefinition*, AAPXSRecipientInstance*, bool host);
+        static void aapxs_parameters_release_instance_context(struct AAPXSDefinition* feature, void* aapxsContext);
+        static AAPXSExtensionHostReceiver aapxs_parameters_get_host_receiver(
+                struct AAPXSDefinition *feature,
+                AAPXSRecipientInstance *aapxsInstance,
+                AndroidAudioPluginHost *host);
+
+        static void* aapxs_parameters_as_plugin_extension(AAPXSExtensionClientProxy* proxy) {
+            return static_cast<ParametersClientAAPXS*>(proxy->aapxs_context)->asPluginExtension();
+        }
+
+        static void* aapxs_parameters_as_host_extension(AAPXSExtensionServiceProxy* proxy) {
+            return ((ParametersServiceAAPXS*) proxy->aapxs_context)->asHostExtension();
+        }
+
+        static void* aapxs_parameters_as_host_receiver(AAPXSExtensionHostReceiver* receiver);
+
+        // Per-opcode RT-safety, matching the RT_SAFE/RT_UNSAFE annotations in ext/parameters.h.
+        // - get_parameter_count is RT_SAFE.
+        // - get_parameter / get_parameter_property / get_enumeration_count / get_enumeration are
+        //   RT_UNSAFE: they can be issued hundreds/thousands at a time over one shared serialization
+        //   buffer, so they stay on the synchronous Binder path.
+        // Host callbacks are always treated as RT-unsafe by the runtime, so they are not handled here.
+        static bool aapxs_parameters_is_command_rt_safe(struct AAPXSDefinition*, bool isHostExtension, int32_t opcode) {
+            if (isHostExtension)
+                return false;
+            return opcode == OPCODE_PARAMETERS_GET_PARAMETER_COUNT;
+        }
+
+        AAPXSDefinition aapxs_parameters{
+            this,
+            AAP_PARAMETERS_EXTENSION_URI,
+            PARAMETERS_SHARED_MEMORY_SIZE,
+            aapxs_parameters_process_incoming_plugin_aapxs_request,
+            aapxs_parameters_process_incoming_host_aapxs_request,
+            aapxs_parameters_process_incoming_plugin_aapxs_reply,
+            aapxs_parameters_process_incoming_host_aapxs_reply,
+            aapxs_parameters_get_plugin_proxy,
+            aapxs_parameters_get_host_proxy,
+            aapxs_parameters_is_command_rt_safe,
+            aapxs_parameters_get_host_receiver,
+            aapxs_parameters_release_instance_context,
+            aapxs_parameters_request_flags,
+            aapxs_parameters_state_changed,
+            aapxs_parameters_release_plugin_context,
+            aapxs_parameters_outgoing_host_request,
+            initializeTypedAAPXSInitiator<ParametersClientAAPXS , ParametersServiceAAPXS>,
+            aapxs_parameters_initialize_recipient,
+            releaseTypedAAPXSInitiator,
+            aapxs_parameters_release_recipient
+        };
+
+    public:
+        AAPXSDefinition& asPublic() override {
+            return aapxs_parameters;
+        }
+    };
+}
+
+#endif //AAP_CORE_PARAMETERS_AAPXS_H

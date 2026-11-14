@@ -1,0 +1,373 @@
+
+#include <sys/mman.h>
+#include <cstdlib>
+#include <future>
+#include <memory>
+#include <android/sharedmem.h>
+#include <android/log.h>
+#include <aidl/org/androidaudioplugin/BpAudioPluginInterface.h>
+#include <aidl/org/androidaudioplugin/BnAudioPluginExtensionCallback.h>
+#include <aidl/org/androidaudioplugin/BnAudioPluginInterface.h>
+#include "aap/android-audio-plugin.h"
+#include "aap/core/host/android/audio-plugin-host-android.h"
+#include "aap/core/aapxs/extension-service.h"
+#include "aap/unstable/logging.h"
+#include "AudioPluginInterfaceImpl.h"
+#include "../core/hosting/audio-plugin-host-internals.h"
+#include "audio-plugin-host-android-internal.h"
+#include "../core/hosting/connection-list-lock.h"
+
+#define AAP_PXORY_LOG_TAG "AAP.proxy"
+
+// AAP plugin implementation that performs actual work via AAP binder client.
+
+class AAPClientContext {
+
+public:
+	const char *unique_id{nullptr};
+	int32_t instance_id{-1};
+	aap::AndroidPluginClientConnectionData* connection_data{nullptr};
+    aap::PluginInstantiationState proxy_state{aap::PLUGIN_INSTANTIATION_STATE_INITIAL};
+	AndroidAudioPluginHost host;
+    AndroidAudioPlugin* plugin{nullptr};
+
+    ~AAPClientContext();
+
+	aidl::org::androidaudioplugin::IAudioPluginInterface* getProxy() { return connection_data->getProxy(); }
+};
+
+class AudioPluginExtensionCallbackImpl : public aidl::org::androidaudioplugin::BnAudioPluginExtensionCallback {
+    std::promise<void>* promise;
+    aapxs_completion_callback callback{nullptr};
+    aapxs_error_callback error_callback{nullptr};
+    void* callbackData{nullptr};
+    AndroidAudioPlugin* plugin{nullptr};
+public:
+    explicit AudioPluginExtensionCallbackImpl(std::promise<void>* promise,
+                                             aapxs_completion_callback callback,
+                                             aapxs_error_callback errorCallback,
+                                             void* callbackData,
+                                             AndroidAudioPlugin* plugin)
+            : promise(promise), callback(callback), error_callback(errorCallback),
+              callbackData(callbackData), plugin(plugin) {}
+
+    ::ndk::ScopedAStatus completed(int32_t in_instanceId, int32_t in_requestId, const std::string& in_errorMessage) override {
+        (void) in_instanceId;
+        (void) in_requestId;
+        // A non-empty error message means the service reported a failure for this request.
+        if (!in_errorMessage.empty() && error_callback)
+            error_callback(callbackData, plugin, in_errorMessage.c_str());
+        else if (callback)
+            callback(callbackData, plugin);
+        else if (promise)
+            promise->set_value();
+        return ::ndk::ScopedAStatus::ok();
+    }
+};
+
+
+AAPClientContext::~AAPClientContext() {
+    if (connection_data && instance_id >= 0) {
+        connection_data->unregisterRemoteInstance(instance_id);
+    }
+	if (instance_id >= 0 && connection_data && getProxy()) {
+		getProxy()->destroy(instance_id);
+        instance_id = -1;
+	}
+}
+
+void aap_bcap_log_error_with_details(const char* fmtBase, ndk::ScopedAStatus& status) {
+#ifdef __ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__
+	if (__builtin_available(android 30, *)) {
+#else
+		if (__ANDROID_API__ >= 30) {
+#endif
+		aap::a_log_f(AAP_LOG_LEVEL_ERROR, AAP_PXORY_LOG_TAG, (std::string{fmtBase} + ": %s").c_str(),
+					 status.getDescription().c_str());
+	} else {
+		aap::a_log_f(AAP_LOG_LEVEL_ERROR, AAP_PXORY_LOG_TAG, fmtBase);
+	}
+}
+
+void aap_client_as_plugin_prepare(AndroidAudioPlugin *plugin, int32_t sampleRate, aap_buffer_t* buffer)
+{
+	auto ctx = (AAPClientContext*) plugin->plugin_specific;
+	if (ctx->proxy_state == aap::PLUGIN_INSTANTIATION_STATE_ERROR)
+		return;
+
+	int n = buffer->num_ports(buffer);
+
+	if (ctx->proxy_state != aap::PLUGIN_INSTANTIATION_STATE_ERROR) {
+		auto status = ctx->getProxy()->beginPrepare(ctx->instance_id);
+		if (!status.isOk()) {
+			aap_bcap_log_error_with_details("beginPrepare() failed", status);
+			ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_ERROR;
+		}
+	}
+
+    // allocate shm FDs, first locally, then send it to the target AAP.
+	auto instance = (aap::RemotePluginInstance*) ctx->host.context;
+	auto shm = dynamic_cast<aap::ClientPluginSharedMemoryStore*>(instance->getSharedMemoryStore());
+	// In bus mode, all the port buffers are in one pool.
+	if (shm->usesBufferPool())
+		n = 1;
+    for (int i = 0; i < n; i++) {
+		auto fd = shm->usesBufferPool() ? shm->getBufferPoolFD() : shm->getPortBufferFD(i);
+        ::ndk::ScopedFileDescriptor sfd{dup(fd)};
+        auto status = ctx->getProxy()->prepareMemory(ctx->instance_id, i, sfd);
+        if (!status.isOk()) {
+			aap_bcap_log_error_with_details("prepareMemory() failed", status);
+            ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_ERROR;
+            break;
+        }
+    }
+
+    if (ctx->proxy_state != aap::PLUGIN_INSTANTIATION_STATE_ERROR) {
+        auto status = ctx->getProxy()->endPrepare(ctx->instance_id, buffer->num_frames(buffer), sampleRate);
+        if (!status.isOk()) {
+			aap_bcap_log_error_with_details("endPrepare() failed", status);
+            ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_ERROR;
+        }
+
+		ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_INACTIVE;
+    }
+}
+
+void aap_client_as_plugin_activate(AndroidAudioPlugin *plugin)
+{
+	auto ctx = (AAPClientContext*) plugin->plugin_specific;
+	if (ctx->proxy_state == aap::PLUGIN_INSTANTIATION_STATE_ERROR)
+		return;
+
+    auto status = ctx->getProxy()->activate(ctx->instance_id);
+    if (!status.isOk()) {
+        aap_bcap_log_error_with_details("activate() failed", status);
+        ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_ERROR;
+    }
+
+    ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_ACTIVE;
+}
+
+void aap_client_as_plugin_process(AndroidAudioPlugin *plugin,
+	aap_buffer_t* buffer,
+	int32_t frameCount,
+	int64_t timeoutInNanoseconds)
+{
+	auto ctx = (AAPClientContext*) plugin->plugin_specific;
+	if (ctx->proxy_state == aap::PLUGIN_INSTANTIATION_STATE_ERROR)
+		return;
+
+	auto instance = (aap::RemotePluginInstance*) ctx->host.context;
+	auto shmBuffer = instance->getAudioPluginBuffer();
+
+	if (shmBuffer != buffer)
+		// FIXME: copy only input ports
+		for (int32_t i = 0; i < buffer->num_ports(buffer); i++)
+			memcpy(shmBuffer->get_buffer(shmBuffer, i), buffer->get_buffer(buffer, i), buffer->get_buffer_size(buffer, i));
+
+	auto status = ctx->getProxy()->process(ctx->instance_id, frameCount, timeoutInNanoseconds);
+	if (!status.isOk()) {
+		aap_bcap_log_error_with_details("process() failed", status);
+		ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_ERROR;
+	}
+
+	if (shmBuffer != buffer)
+		// FIXME: copy only output ports
+		for (int32_t i = 0; i < buffer->num_ports(buffer); i++)
+			memcpy(buffer->get_buffer(buffer, i), shmBuffer->get_buffer(shmBuffer, i), shmBuffer->get_buffer_size(shmBuffer, i));
+}
+
+void aap_client_as_plugin_deactivate(AndroidAudioPlugin *plugin)
+{
+	auto ctx = (AAPClientContext*) plugin->plugin_specific;
+	if (ctx->proxy_state == aap::PLUGIN_INSTANTIATION_STATE_ERROR)
+		return;
+
+	auto status = ctx->getProxy()->deactivate(ctx->instance_id);
+	if (!status.isOk()) {
+		aap_bcap_log_error_with_details("deactivate() failed", status);
+		ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_ERROR;
+	}
+
+    ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_INACTIVE;
+}
+
+// we do not care much about realtime safety breakage by lack of URID support here,
+// because it is about Binder `extension()` call...
+void* aap_client_as_plugin_get_extension(AndroidAudioPlugin *plugin, const char *uri)
+{
+	auto ctx = (AAPClientContext*) plugin->plugin_specific;
+    auto instance = (aap::RemotePluginInstance*) ctx->host.context;
+    return instance->getPluginExtensionProxy(uri);
+}
+
+aap_plugin_info_t aap_client_as_plugin_get_plugin_info(AndroidAudioPlugin *plugin)
+{
+    auto ctx = (AAPClientContext*) plugin->plugin_specific;
+    auto hostExt = (aap_host_plugin_info_extension_t*) ctx->host.get_extension(&ctx->host, AAP_PLUGIN_INFO_EXTENSION_URI);
+    return hostExt->get(hostExt, &ctx->host, ctx->unique_id);
+}
+
+// we do not care much about realtime safety breakage by lack of URID support here,
+// because it is about Binder `extension()` call...
+bool aap_client_as_plugin_send_extension_message_delegate(void* context,
+                                                          const char* uri,
+                                                          int32_t instanceId,
+                                                          int32_t messageSize,
+                                                          int32_t requestId,
+                                                          int32_t opcode,
+                                                          aapxs_completion_callback callback,
+                                                          void* callbackData,
+                                                          aapxs_error_callback errorCallback) {
+    (void) messageSize;
+    auto ctx = (AAPClientContext*) context;
+    if (ctx->proxy_state == aap::PLUGIN_INSTANTIATION_STATE_ERROR)
+        return false;
+
+    // Extension-agnostic: any request that carries a completion callback is asynchronous.
+    // (The blocking-sync wrappers supply one too and wait on their own future.)
+    bool async = callback != nullptr;
+    std::promise<void> promise{};
+    auto future = promise.get_future();
+    auto binderCallback = ndk::SharedRefBase::make<AudioPluginExtensionCallbackImpl>(
+            async ? nullptr : &promise,
+            async ? callback : nullptr,
+            async ? errorCallback : nullptr,
+            async ? callbackData : nullptr,
+            ctx->plugin);
+    auto stat = ctx->getProxy()->extension(instanceId, uri, opcode, requestId, binderCallback->ref<AudioPluginExtensionCallbackImpl>());
+    if (!stat.isOk()) {
+        aap_bcap_log_error_with_details("extension() failed", stat);
+        ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_ERROR;
+        return false;
+    }
+
+    if (async)
+        return true;
+
+    future.wait();
+    return false;
+}
+
+AndroidAudioPlugin* aap_client_as_plugin_new(
+	AndroidAudioPluginFactory *pluginFactory,
+	const char* pluginUniqueId,
+	AndroidAudioPluginHost* host
+	)
+{
+    if (!pluginFactory) {
+        AAP_ASSERT_FALSE;
+        return nullptr;
+    }
+    if (!pluginUniqueId) {
+        AAP_ASSERT_FALSE;
+        return nullptr;
+    }
+    if (!host) {
+        AAP_ASSERT_FALSE;
+        return nullptr;
+    }
+
+    auto client = (aap::PluginClient*) pluginFactory->factory_context;
+    auto instance = static_cast<aap::RemotePluginInstance*>(host->context);
+    if (!instance)
+        return nullptr;
+    auto descriptor = instance->getPluginInformation();
+    auto ctxOwner = std::make_unique<AAPClientContext>();
+    auto ctx = ctxOwner.get();
+    ctx->host = *host;
+    {
+        const std::lock_guard<std::recursive_mutex> lock{aap::internal::connectionListMutex()};
+        ctx->connection_data = (aap::AndroidPluginClientConnectionData*) client->getConnections()->getServiceHandleForConnectedPlugin(descriptor->getPluginPackageName(), descriptor->getPluginLocalName());
+        // Published connection data is retained in the process-lifetime native registry.
+        // The scoped entry can disappear, but this connection/proxy cannot be freed underneath us.
+        if (!ctx->connection_data || !ctx->connection_data->isValid() || !ctx->getProxy()) {
+            aap::a_log(AAP_LOG_LEVEL_WARN, AAP_PXORY_LOG_TAG, "Plugin service disconnected before beginCreate()");
+            return nullptr;
+        }
+    }
+
+    ctx->unique_id = pluginUniqueId;
+
+    auto status = ctx->getProxy()->beginCreate(pluginUniqueId, &ctx->instance_id);
+    if (!status.isOk()) {
+		aap_bcap_log_error_with_details("beginCreate() failed", status);
+        return nullptr;
+    } else {
+
+		instance->setInstanceId(ctx->instance_id);
+
+        // It is a nasty workaround to not expose Binder back to platform-agnostic aap::RemotePluginInstance; we set a callable function for them here.
+        instance->setIpcExtensionMessageSender(aap_client_as_plugin_send_extension_message_delegate);
+
+        // Set up shared memory FDs for plugin extension services.
+        // We make use of plugin metadata that should list up required and optional extensions.
+        if (!instance->setupAAPXSInstances([&](const char* uri, AAPXSSerializationContext *serialization) {
+            if (!serialization->data_capacity) return true;
+            // create asharedmem and add as an extension FD, keep it until it is destroyed.
+            auto fd = ASharedMemory_create(nullptr, serialization->data_capacity);
+            if (fd < 0) return false;
+            auto shm = instance->getSharedMemoryStore();
+            serialization->data = shm->addExtensionFD(fd, serialization->data_capacity);
+            if (!serialization->data || serialization->data == MAP_FAILED) return false;
+
+            if (ctx->proxy_state != aap::PLUGIN_INSTANTIATION_STATE_ERROR) {
+                ndk::ScopedFileDescriptor sfd{dup(fd)};
+                auto* definition = instance->getAAPXSDispatcher().getDefinitionByUri(uri);
+                auto declaredCapacity = definition && definition->uri ? definition->data_capacity : serialization->data_capacity;
+                auto stat = ctx->getProxy()->addExtension(ctx->instance_id, uri, sfd, declaredCapacity);
+                if (!stat.isOk()) {
+                    aap_bcap_log_error_with_details("addExtension() failed", stat);
+                    ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_ERROR;
+                }
+            }
+            return ctx->proxy_state != aap::PLUGIN_INSTANTIATION_STATE_ERROR;
+        }))
+            ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_ERROR;
+
+        if (ctx->proxy_state != aap::PLUGIN_INSTANTIATION_STATE_ERROR) {
+            // Publish callbacks only after the dispatcher and buffers are fully initialized.
+            // endCreate() instantiates the plugin backend, which may call host extensions.
+            ctx->connection_data->registerRemoteInstance(ctx->instance_id, instance);
+            if (!ctx->connection_data->isValid())
+                return nullptr;
+            status = ctx->getProxy()->endCreate(ctx->instance_id);
+            if (status.isOk()) instance->getAAPXSDispatcher().refreshTransport();
+            if (!status.isOk()) {
+                aap_bcap_log_error_with_details("endCreate() failed", status);
+                ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_ERROR;
+            }
+            if (ctx->proxy_state != aap::PLUGIN_INSTANTIATION_STATE_ERROR)
+                ctx->proxy_state = aap::PLUGIN_INSTANTIATION_STATE_INACTIVE;
+        }
+    }
+    if (ctx->proxy_state == aap::PLUGIN_INSTANTIATION_STATE_ERROR || !ctx->connection_data->isValid())
+        return nullptr;
+
+    auto result = new AndroidAudioPlugin {
+		ctx,
+		aap_client_as_plugin_prepare,
+		aap_client_as_plugin_activate,
+		aap_client_as_plugin_process,
+		aap_client_as_plugin_deactivate,
+		aap_client_as_plugin_get_extension,
+		aap_client_as_plugin_get_plugin_info
+		};
+    ctx->plugin = result;
+    ctxOwner.release();
+    return result;
+}
+
+void aap_client_as_plugin_delete(
+		AndroidAudioPluginFactory *pluginFactory,	// unused
+		AndroidAudioPlugin *instance)
+{
+	auto ctx = (AAPClientContext*) instance->plugin_specific;
+
+	delete ctx;
+	delete instance;
+}
+
+AndroidAudioPluginFactory *GetAndroidAudioPluginFactoryClientBridge(aap::PluginClient* client) {
+	return new AndroidAudioPluginFactory{aap_client_as_plugin_new, aap_client_as_plugin_delete, client};
+}

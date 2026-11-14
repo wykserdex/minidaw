@@ -1,0 +1,1118 @@
+
+#include <jni.h>
+#include <android/log.h>
+#include <android/sharedmem_jni.h>
+#include <cstdlib>
+#include <limits>
+#include <pthread.h>
+#include <sys/mman.h>
+#include "aidl/org/androidaudioplugin/BnAudioPluginInterface.h"
+#include "aidl/org/androidaudioplugin/BpAudioPluginInterface.h"
+#include "aap/core/host/audio-plugin-host.h"
+#include "aap/core/host/android/audio-plugin-host-android.h"
+#include "aap/core/android/android-application-context.h"
+#include "AudioPluginInterfaceImpl.h"
+#include "audio-plugin-host-android-internal.h"
+#include "../core/hosting/plugin-service-list.h"
+#include "../core/hosting/plugin-parameter-state.h"
+#include "../core/hosting/instance-realtime-state.h"
+#include "../core/AAPJniFacade.h"
+
+#define LOG_TAG "AAP.JNI"
+
+int32_t readLocalGuiListenerMidi2Output(aap::LocalPluginInstance* instance, void* output, int32_t size);
+
+std::string jstringToStdString(JNIEnv* env, jstring s) {
+    jboolean b{false};
+    const char *u8 = env->GetStringUTFChars(s, &b);
+    std::string ret{u8};
+    if (b)
+        env->ReleaseStringUTFChars(s, u8);
+    return ret;
+}
+
+
+// --------------------------------------------------
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_AudioPluginNatives_initializeAAPJni(JNIEnv *env, jclass clazz,
+                                                                jobject applicationContext) {
+    aap::set_application_context(env, applicationContext);
+    aap::AAPJniFacade::getInstance()->initializeJNIMetadata();
+}
+
+// --------------------------------------------------
+
+std::shared_ptr<aidl::org::androidaudioplugin::BnAudioPluginInterface> sp_binder;
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_org_androidaudioplugin_AudioPluginNatives_createBinderForService(JNIEnv *env, jclass clazz) {
+    sp_binder = ndk::SharedRefBase::make<aap::AudioPluginInterfaceImpl>();
+    auto ret = AIBinder_toJavaBinder(env, sp_binder->asBinder().get());
+    return ret;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_AudioPluginNatives_destroyBinderForService(JNIEnv *env, jclass clazz,
+                                                                      jobject binder) {
+    sp_binder.reset();
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_AudioPluginNatives_prepareNativeLooper(JNIEnv *env, jclass clazz) {
+	aap::prepare_non_rt_event_looper();
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_AudioPluginNatives_startNativeLooper(JNIEnv *env, jclass clazz) {
+	aap::start_non_rt_event_looper();
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_AudioPluginNatives_stopNativeLooper(JNIEnv *env, jclass clazz) {
+	aap::stop_non_rt_event_looper();
+}
+
+// --------------------------------------------------
+
+std::map<AIBinder*,aap::AndroidPluginClientConnectionData*> live_connection_data{};
+namespace {
+// Only registration takes this mutex; Binder callbacks never do. A repeated Java Binder
+// must not replace the service callback and orphan instances on its existing connection.
+std::mutex connection_initialization_mutex;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_AudioPluginNatives_addBinderForClient(JNIEnv *env, jclass clazz, jint connectorInstanceId,
+                                                                jstring packageName, jstring className, jobject binder) {
+    std::string packageNameString = jstringToStdString(env, packageName);
+    std::string classNameString = jstringToStdString(env, className);
+	auto aiBinder = AIBinder_fromJavaBinder(env, binder);
+    if (!aiBinder) {
+        aap::a_log_f(AAP_LOG_LEVEL_ERROR, LOG_TAG,
+                     "addBinderForClient: failed to convert Java binder for %s/%s",
+                     packageNameString.c_str(), classNameString.c_str());
+        auto exception = env->FindClass("org/androidaudioplugin/AudioPluginException");
+        if (exception)
+            env->ThrowNew(exception, "Failed to convert plugin service Binder");
+        return;
+    }
+    std::lock_guard<std::mutex> initialization{connection_initialization_mutex};
+	aap::AndroidPluginClientConnectionData* connectionData = nullptr;
+	for (auto &pair : live_connection_data)
+		if (pair.first == aiBinder)
+			connectionData = pair.second;
+    if (!connectionData) {
+        connectionData = new aap::AndroidPluginClientConnectionData(aiBinder);
+        live_connection_data[aiBinder] = connectionData;
+		AIBinder_incStrong(aiBinder);
+    }
+	AIBinder_decStrong(aiBinder);
+
+    if (!connectionData->isValid()) {
+        aap::a_log_f(AAP_LOG_LEVEL_ERROR, LOG_TAG,
+                     "addBinderForClient: failed to initialize binder client for %s/%s",
+                     packageNameString.c_str(), classNameString.c_str());
+        // Keep the callback/death-recipient owner alive in the existing process-lifetime
+        // registry even if death raced initialization. Never publish it as a scoped connection.
+        auto exception = env->FindClass("org/androidaudioplugin/AudioPluginException");
+        if (exception)
+            env->ThrowNew(exception, "Plugin service disconnected during connection initialization");
+        return;
+    }
+    aap::AAPJniFacade::getInstance()->addScopedClientConnection(connectorInstanceId,
+																packageNameString, classNameString, connectionData);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_AudioPluginNatives_removeBinderForClient(JNIEnv *env, jclass clazz, jint connectorInstanceId,
+																   jstring packageName, jstring className) {
+	std::string packageNameString = jstringToStdString(env, packageName);
+	std::string classNameString = jstringToStdString(env, className);
+	aap::AAPJniFacade::getInstance()->removeScopedClientConnection(connectorInstanceId, packageNameString, classNameString);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_AudioPluginServiceConnector_nativeOnServiceConnectedCallback(
+		JNIEnv *env, jobject thiz, jstring servicePackageName) {
+	auto s = jstringToStdString(env, servicePackageName);
+	aap::AAPJniFacade::getInstance()->handleServiceConnectedCallback(s);
+}
+
+// --------------------------------------------------
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_AudioPluginNatives_getSharedMemoryFD(JNIEnv *env, jclass clazz, jobject shm) {
+	return ASharedMemory_dupFromJava(env, shm);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_AudioPluginNatives_closeSharedMemoryFD(JNIEnv *env, jclass clazz, int fd) {
+	close(fd);
+}
+
+
+
+// Shared by every PluginClient created from Kotlin. It is (re)queried lazily on lookups whenever
+// plugin packages were changed (see InstalledPluginsMonitor).
+aap::PluginListSnapshot cached_plugin_list{};
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_InstalledPluginsMonitor_notifyInstalledPluginsChanged(JNIEnv *env, jclass clazz) {
+	aap::PluginListSnapshot::notifyInstalledPluginsChanged();
+}
+
+extern "C"
+JNIEXPORT jlong JNICALL
+Java_org_androidaudioplugin_hosting_NativePluginClient_newInstance(JNIEnv *env, jclass clazz,
+																   jint serviceConnectionId) {
+	auto connections = aap::AAPJniFacade::getInstance()->getPluginConnectionListFromJni(serviceConnectionId, true);
+	if (!connections) {
+        AAP_ASSERT_FALSE;
+        return -1;
+    }
+	return (jlong) (void*) new aap::PluginClient(connections, &cached_plugin_list);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativePluginClient_destroyInstance(JNIEnv *env, jclass clazz,
+																	   jlong native) {
+	auto client = (aap::PluginClient*) native;
+	delete client;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_createRemotePluginInstance(
+		JNIEnv *env, jclass clazz, jstring plugin_id, jlong clientPointer) {
+	if (clientPointer == 0) {
+        aap::a_log(AAP_LOG_LEVEL_ERROR, LOG_TAG, "null clientPointer");
+        AAP_ASSERT_FALSE;
+        return -1;
+    }
+	auto client = (aap::PluginClient*) (void*) clientPointer;
+	std::string pluginIdString = jstringToStdString(env, plugin_id);
+    aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
+                 "createRemotePluginInstance: pluginId=%s", pluginIdString.c_str());
+	auto result = client->createInstance(pluginIdString, true);
+	if (!result.error.empty()) {
+		aap::a_log_f(AAP_LOG_LEVEL_ERROR, LOG_TAG,
+                     "createRemotePluginInstance failed: pluginId=%s error=%s",
+                     pluginIdString.c_str(), result.error.c_str());
+		return (jlong) -1;
+	}
+    aap::a_log_f(AAP_LOG_LEVEL_INFO, LOG_TAG,
+                 "createRemotePluginInstance: pluginId=%s instanceId=%d",
+                 pluginIdString.c_str(), result.value);
+	auto instance = dynamic_cast<aap::RemotePluginInstance*>(client->getInstanceById(result.value));
+    if (!instance) {
+        aap::a_log_f(AAP_LOG_LEVEL_ERROR, LOG_TAG, "instance for id %i not found.", result.value);
+        AAP_ASSERT_FALSE;
+        return -1;
+    }
+	return (jlong) result.value;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_prepare(JNIEnv *env, jclass clazz,
+																			jlong nativeClient,
+																			jint instanceId,
+																			jint frameCount,
+																			jint sampleRate,
+																			jint defaultControlBytesPerBlock) {
+	auto client = (aap::PluginClient*) (void*) nativeClient;
+	auto instance = (aap::RemotePluginInstance*) client->getInstanceById(instanceId);
+    instance->prepare(frameCount, sampleRate, defaultControlBytesPerBlock);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_activate(JNIEnv *env, jclass clazz,
+																		jlong nativeClient,
+																		jint instanceId) {
+    auto client = (aap::PluginClient*) (void*) nativeClient;
+    auto instance = client->getInstanceById(instanceId);
+	instance->activate();
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_process(JNIEnv *env, jclass clazz,
+																	   jlong nativeClient,
+																	   jint instanceId,
+																	   jint frameCount,
+																	   jlong timeout_in_nanoseconds) {
+    auto client = (aap::PluginClient*) (void*) nativeClient;
+    auto instance = client->getInstanceById(instanceId);
+	instance->process(frameCount, timeout_in_nanoseconds);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_deactivate(JNIEnv *env, jclass clazz,
+																		  jlong nativeClient,
+																		  jint instanceId) {
+    auto client = (aap::PluginClient*) (void*) nativeClient;
+    auto instance = client->getInstanceById(instanceId);
+	instance->deactivate();
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_destroy(JNIEnv *env, jclass clazz,
+																	   jlong nativeClient,
+																	   jint instanceId) {
+    auto client = (aap::PluginClient*) (void*) nativeClient;
+    auto instance = client->getInstanceById(instanceId);
+    client->destroyInstance(instance);
+}
+
+// Parameter layout changes
+
+namespace {
+// Holds a global reference to the Java listener; deleted when the listener is replaced or cleared.
+struct JavaParameterLayoutListener {
+    jobject listener;
+
+    explicit JavaParameterLayoutListener(JNIEnv* env, jobject listener) : listener(env->NewGlobalRef(listener)) {}
+
+    ~JavaParameterLayoutListener() {
+        withJNIEnv([&](JNIEnv* env) { env->DeleteGlobalRef(listener); });
+    }
+
+    void invoke() {
+        withJNIEnv([&](JNIEnv* env) {
+            auto klass = env->GetObjectClass(listener);
+            auto run = env->GetMethodID(klass, "run", "()V");
+            env->CallVoidMethod(listener, run);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+            env->DeleteLocalRef(klass);
+        });
+    }
+
+    // The listener is invoked on aap-core's parameter layout worker thread, which is not attached
+    // to the JVM by default.
+    static void withJNIEnv(const std::function<void(JNIEnv*)>& func) {
+        auto vm = aap::get_android_jvm();
+        JNIEnv* env{nullptr};
+        auto envState = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+        if (envState == JNI_EDETACHED) {
+            // keep the thread name; ART renames unnamed attached threads to "Thread-NNN".
+            char name[16]{};
+            pthread_getname_np(pthread_self(), name, sizeof(name));
+            JavaVMAttachArgs args{JNI_VERSION_1_6, name, nullptr};
+            if (vm->AttachCurrentThread(&env, &args) != JNI_OK)
+                return;
+        }
+        func(env);
+        if (envState == JNI_EDETACHED)
+            vm->DetachCurrentThread();
+    }
+};
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_setParameterLayoutChangedListener(JNIEnv *env,
+                                                                                                jclass clazz,
+                                                                                                jlong nativeClient,
+                                                                                                jint instanceId,
+                                                                                                jobject listener) {
+    auto client = (aap::PluginClient*) (void*) nativeClient;
+    auto instance = dynamic_cast<aap::RemotePluginInstance*>(client->getInstanceById(instanceId));
+    if (!instance)
+        return;
+    if (!listener) {
+        aap::internal::setParameterLayoutChangedListener(*instance, {});
+        return;
+    }
+    auto holder = std::make_shared<JavaParameterLayoutListener>(env, listener);
+    aap::internal::setParameterLayoutChangedListener(*instance, [holder] {
+        holder->invoke();
+    });
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_setBusesChangedListener(JNIEnv *env,
+                                                                                      jclass clazz,
+                                                                                      jlong nativeClient,
+                                                                                      jint instanceId,
+                                                                                      jobject listener) {
+    auto client = (aap::PluginClient*) (void*) nativeClient;
+    auto instance = dynamic_cast<aap::RemotePluginInstance*>(client->getInstanceById(instanceId));
+    if (!instance)
+        return;
+    if (!listener) {
+        instance->setBusesChangedHandler({});
+        return;
+    }
+    // A java.util.function.IntConsumer, invoked with AAP_BUSES_CHANGED_* flags.
+    auto holder = std::make_shared<JavaParameterLayoutListener>(env, listener);
+    instance->setBusesChangedHandler([holder](uint32_t flags) {
+        JavaParameterLayoutListener::withJNIEnv([&](JNIEnv* jni) {
+            auto klass = jni->GetObjectClass(holder->listener);
+            jni->CallVoidMethod(holder->listener, jni->GetMethodID(klass, "accept", "(I)V"), (jint) flags);
+            if (jni->ExceptionCheck()) {
+                jni->ExceptionDescribe();
+                jni->ExceptionClear();
+            }
+            jni->DeleteLocalRef(klass);
+        });
+    });
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_refreshBusLayout(JNIEnv *env, jclass,
+                                                                               jlong nativeClient,
+                                                                               jint instanceId) {
+    auto client = (aap::PluginClient*) (void*) nativeClient;
+    auto instance = dynamic_cast<aap::RemotePluginInstance*>(client->getInstanceById(instanceId));
+    if (!instance)
+        return env->NewStringUTF("instance not found");
+    auto error = instance->refreshBusLayout();
+    return error.empty() ? nullptr : env->NewStringUTF(error.c_str());
+}
+
+namespace {
+// Cache classes in the initiating Java class loader; a native worker has no Java caller frame.
+struct JavaParameterMetadataSnapshotBuilder {
+    jclass parameter_class;
+    jclass snapshot_class;
+    jmethodID constructor;
+    jmethodID add_enum;
+    jmethodID from_native;
+
+    explicit JavaParameterMetadataSnapshotBuilder(JNIEnv* env) {
+        auto parameter = env->FindClass("org/androidaudioplugin/ParameterInformation");
+        auto snapshot = env->FindClass("org/androidaudioplugin/hosting/ParameterMetadataSnapshot");
+        parameter_class = static_cast<jclass>(env->NewGlobalRef(parameter));
+        snapshot_class = static_cast<jclass>(env->NewGlobalRef(snapshot));
+        constructor = env->GetMethodID(parameter_class, "<init>", "(ILjava/lang/String;DDD)V");
+        add_enum = env->GetMethodID(parameter_class, "addEnum", "(IDLjava/lang/String;)V");
+        from_native = env->GetStaticMethodID(snapshot_class, "fromNative",
+                "(J[Lorg/androidaudioplugin/ParameterInformation;)Lorg/androidaudioplugin/hosting/ParameterMetadataSnapshot;");
+        env->DeleteLocalRef(parameter);
+        env->DeleteLocalRef(snapshot);
+    }
+    ~JavaParameterMetadataSnapshotBuilder() {
+        JavaParameterLayoutListener::withJNIEnv([&](JNIEnv* env) {
+            env->DeleteGlobalRef(parameter_class);
+            env->DeleteGlobalRef(snapshot_class);
+        });
+    }
+    jobject create(JNIEnv* env, const aap::internal::ParameterMetadataSnapshot& snapshot) {
+        auto parameters = env->NewObjectArray(snapshot.parameters.size(), parameter_class, nullptr);
+        if (!parameters) return nullptr;
+        for (size_t index = 0; index < snapshot.parameters.size(); ++index) {
+            auto& parameter = snapshot.parameters[index];
+            auto name = env->NewStringUTF(parameter.getName());
+            auto object = env->NewObject(parameter_class, constructor, parameter.getId(), name,
+                    parameter.getMinimumValue(), parameter.getMaximumValue(), parameter.getDefaultValue());
+            const bool constructionFailed = env->ExceptionCheck();
+            env->DeleteLocalRef(name);
+            if (constructionFailed || !object) {
+                env->DeleteLocalRef(object);
+                env->DeleteLocalRef(parameters);
+                return nullptr;
+            }
+            for (int32_t enumIndex = 0; enumIndex < parameter.getEnumCount(); ++enumIndex) {
+                auto enumeration = parameter.getEnumeration(enumIndex);
+                auto enumName = env->NewStringUTF(enumeration.getName().c_str());
+                env->CallVoidMethod(object, add_enum, enumeration.getIndex(), enumeration.getValue(), enumName);
+                const bool enumFailed = env->ExceptionCheck();
+                env->DeleteLocalRef(enumName);
+                if (enumFailed) {
+                    env->DeleteLocalRef(object);
+                    env->DeleteLocalRef(parameters);
+                    return nullptr;
+                }
+            }
+            env->SetObjectArrayElement(parameters, index, object);
+            env->DeleteLocalRef(object);
+        }
+        auto result = env->CallStaticObjectMethod(snapshot_class, from_native,
+                static_cast<jlong>(snapshot.revision), parameters);
+        const bool conversionFailed = env->ExceptionCheck();
+        env->DeleteLocalRef(parameters);
+        return conversionFailed ? nullptr : result;
+    }
+};
+
+// Separate from the compatibility Runnable; its lifetime follows the native instance.
+struct JavaParameterMetadataPublisher {
+    jobject publisher;
+    jmethodID changed;
+    jmethodID destroyed;
+    JavaParameterMetadataSnapshotBuilder builder;
+
+    JavaParameterMetadataPublisher(JNIEnv* env, jobject object) : publisher(env->NewGlobalRef(object)), builder(env) {
+        auto klass = env->GetObjectClass(object);
+        changed = env->GetMethodID(klass, "onNativeMetadataChanged",
+                "(Lorg/androidaudioplugin/hosting/ParameterMetadataSnapshot;)V");
+        destroyed = env->GetMethodID(klass, "onNativeDestroyed", "()V");
+        env->DeleteLocalRef(klass);
+    }
+    void publish(const aap::internal::ParameterMetadataSnapshot& snapshot) {
+        JavaParameterLayoutListener::withJNIEnv([&](JNIEnv* env) {
+            auto value = builder.create(env, snapshot);
+            if (!env->ExceptionCheck()) env->CallVoidMethod(publisher, changed, value);
+            env->DeleteLocalRef(value);
+            if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        });
+    }
+    ~JavaParameterMetadataPublisher() {
+        JavaParameterLayoutListener::withJNIEnv([&](JNIEnv* env) {
+            env->CallVoidMethod(publisher, destroyed);
+            if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+            env->DeleteGlobalRef(publisher);
+        });
+    }
+};
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_connectParameterMetadataPublisherNative(
+        JNIEnv* env, jclass, jlong clientHandle, jint instanceId, jobject publisher) {
+    auto* client = reinterpret_cast<aap::PluginClient*>(clientHandle);
+    auto* instance = client ? dynamic_cast<aap::RemotePluginInstance*>(client->getInstanceById(instanceId)) : nullptr;
+    if (!instance) {
+        auto klass = env->FindClass("java/lang/IllegalStateException");
+        env->ThrowNew(klass, "Plugin instance no longer exists");
+        env->DeleteLocalRef(klass);
+        return;
+    }
+    auto klass = env->GetObjectClass(publisher);
+    auto identityMethod = env->GetMethodID(klass, "onServiceIdentity", "(ILjava/lang/String;Ljava/lang/String;)V");
+    auto packageName = env->NewStringUTF(instance->getPluginInformation()->getPluginPackageName().c_str());
+    auto className = env->NewStringUTF(instance->getPluginInformation()->getPluginLocalName().c_str());
+    auto connectionId = aap::AAPJniFacade::getInstance()->getConnectorInstanceId(client->getConnections());
+    env->CallVoidMethod(publisher, identityMethod, connectionId, packageName, className);
+    const bool identityFailed = env->ExceptionCheck();
+    env->DeleteLocalRef(klass);
+    env->DeleteLocalRef(packageName);
+    env->DeleteLocalRef(className);
+    if (identityFailed) return;
+    auto holder = std::make_shared<JavaParameterMetadataPublisher>(env, publisher);
+    // The worker owns instance lifetime until its dispatch returns. Do not look the instance
+    // up through the client's mutable instance vector while another thread removes it.
+    aap::internal::setParameterMetadataChangedListener(*instance, [holder, instance] {
+        holder->publish(aap::internal::getParameterMetadataSnapshot(*instance));
+    });
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getParameterMetadataSnapshotNative(
+        JNIEnv* env, jclass, jlong clientHandle, jint instanceId) {
+    auto* client = reinterpret_cast<aap::PluginClient*>(clientHandle);
+    auto* instance = client ? client->getInstanceById(instanceId) : nullptr;
+    if (!instance) return nullptr;
+    JavaParameterMetadataSnapshotBuilder builder(env);
+    return builder.create(env, aap::internal::getParameterMetadataSnapshot(*instance));
+}
+
+// State extensions
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getStateSize(JNIEnv *env,
+																			jclass clazz,
+																			jlong nativeClient,
+																			jint instanceId) {
+    auto client = (aap::PluginClient*) (void*) nativeClient;
+    auto instance = client->getInstanceById(instanceId);
+    auto result = instance->getStandardExtensions().getStateSize();
+    if (!result.isOk() || result.value > static_cast<size_t>(std::numeric_limits<jint>::max())) {
+        auto exception = env->FindClass("org/androidaudioplugin/AudioPluginException");
+        if (exception)
+            env->ThrowNew(exception, result.isOk() ? "State size exceeds the Java array limit" : result.error.c_str());
+        return 0; // ignored by Java while the exception is pending
+    }
+    return static_cast<jint>(result.value);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getState(JNIEnv *env, jclass clazz,
+																		jlong nativeClient,
+																		jint instanceId,
+																		jbyteArray data) {
+    auto client = (aap::PluginClient*) (void*) nativeClient;
+    auto instance = client->getInstanceById(instanceId);
+	auto result = instance->getStandardExtensions().getState();
+	if (!result.isOk())
+		return; // e.g. the plugin is gone
+	auto size = std::min(static_cast<jsize>(result.value.data_size), env->GetArrayLength(data));
+	env->SetByteArrayRegion(data, 0, size, static_cast<const jbyte *>(result.value.data));
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_setState(JNIEnv *env, jclass clazz,
+																		jlong nativeClient,
+																		jint instanceId,
+																		jbyteArray data) {
+    auto client = (aap::PluginClient*) (void*) nativeClient;
+    auto instance = client->getInstanceById(instanceId);
+	auto length = env->GetArrayLength(data);
+	jboolean wasCopy;
+	auto buf = env->GetByteArrayElements(data, &wasCopy);
+	instance->getStandardExtensions().setState(buf, length);
+	env->ReleaseByteArrayElements(data, buf, JNI_ABORT);
+}
+
+// Offline rendering extension
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_setOfflineMode(JNIEnv *env,
+																			  jclass clazz,
+																			  jlong nativeClient,
+																			  jint instanceId,
+																			  jboolean offline) {
+	auto client = (aap::PluginClient*) (void*) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+	auto result = instance->getStandardExtensions().setOfflineMode(
+			offline ? AAP_OFFLINE_RENDERING_MODE_OFFLINE : AAP_OFFLINE_RENDERING_MODE_REALTIME);
+	return result.isOk() && result.value == AAP_OFFLINE_RENDERING_RESULT_OK;
+}
+
+// Presets extensions
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getPresetCount(JNIEnv *env,
+																			  jclass clazz,
+																			  jlong nativeClient,
+																			  jint instanceId) {
+	auto client = (aap::PluginClient*) (void*) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+	return instance->getStandardExtensions().getPresetCount();
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_setCurrentPresetIndex(JNIEnv *env,
+																					 jclass clazz,
+																					 jlong nativeClient,
+																					 jint instanceId,
+																					 jint index) {
+	auto client = (aap::PluginClient*) (void*) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+	instance->getStandardExtensions().setCurrentPresetIndex(index);
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getPresetName__JII(JNIEnv *env,
+																				  jclass clazz,
+																				  jlong nativeClient,
+																				  jint instanceId,
+																				  jint index) {
+	auto client = (aap::PluginClient*) (void*) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+	return env->NewStringUTF(instance->getStandardExtensions().getPresetName(index).c_str());
+}
+
+// MIDI extension
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getMidiMappingPolicy(JNIEnv *env,
+																					jclass clazz,
+																					jlong nativeClient,
+																					jint instanceId) {
+	auto client = (aap::PluginClient *) (void *) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+	return (jint) instance->getStandardExtensions().getMidiMappingPolicy();
+}
+
+// GUI extension
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_createGui(JNIEnv *env,
+																	   jclass clazz,
+																	   jlong nativeClient,
+																	   jint instanceId) {
+	auto client = (aap::PluginClient *) (void *) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+	// AudioPluginView is not provided from host side.
+	return instance->getStandardExtensions().createGui(instance->getPluginInformation()->getPluginID(), instanceId, nullptr);
+}
+
+extern "C"
+JNIEXPORT int32_t JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_showGui(JNIEnv *env,
+																	   jclass clazz,
+																	   jlong nativeClient,
+																	   jint instanceId,
+																	   jint guiInstanceId) {
+	auto client = (aap::PluginClient *) (void *) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+	return instance->getStandardExtensions().showGui(guiInstanceId);
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_hideGui(JNIEnv *env,
+																	   jclass clazz,
+																	   jlong nativeClient,
+																	   jint instanceId,
+																	   jint guiInstanceId) {
+	auto client = (aap::PluginClient *) (void *) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+	return instance->getStandardExtensions().hideGui(guiInstanceId);
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_resizeGui(JNIEnv *env,
+																		  jclass clazz,
+																		  jlong nativeClient,
+																		  jint instanceId,
+																		  jint guiInstanceId,
+																		  jint width,
+																		  jint height) {
+	auto client = (aap::PluginClient *) (void *) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+	return instance->getStandardExtensions().resizeGui(guiInstanceId, width, height);
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_destroyGui(JNIEnv *env,
+																	   jclass clazz,
+																	   jlong nativeClient,
+																	   jint instanceId,
+																	   jint guiInstanceId) {
+	auto client = (aap::PluginClient *) (void *) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+	return instance->getStandardExtensions().destroyGui(guiInstanceId);
+}
+
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_addEventUmpInput(JNIEnv *env,
+																			jclass clazz,
+																			jlong nativeClient,
+																			jint instanceId,
+																			jobject data,
+																			jint length) {
+	auto client = (aap::PluginClient *) (void *) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+	auto buf = env->GetDirectBufferAddress(data);
+    instance->addEventUmpInput(buf, length);
+}
+
+// plugin instance (dynamic) information retrieval
+
+jint implPluginHostGetParameterCount(jlong nativeHost,
+                                     jint instanceId) {
+    auto host = (aap::PluginHost *) (void *) nativeHost;
+    auto instance = host->getInstanceById(instanceId);
+    // consistent with a concurrent parameter layout refresh
+    return aap::internal::getParameterCountSafely(*instance);
+}
+
+jdouble implPluginHostGetParameterValue(jlong nativeHost,
+                                        jint instanceId,
+                                        jint index) {
+    auto host = (aap::PluginHost*) (void*) nativeHost;
+    auto instance = host->getInstanceById(instanceId);
+    return aap::internal::getParameterValue(*instance, index);
+}
+
+jint implPluginHostGetPortCount(jlong nativeHost,
+                                jint instanceId) {
+    auto host = (aap::PluginHost*) (void*) nativeHost;
+    auto instance = host->getInstanceById(instanceId);
+    return instance->getNumPorts();
+}
+
+const std::string& implPluginHostGetPluginId(jlong nativeHost,
+                                      jint instanceId) {
+    auto host = (aap::PluginHost*) (void*) nativeHost;
+    auto instance = host->getInstanceById(instanceId);
+    return instance->getPluginInformation()->getPluginID();
+}
+
+extern "C"
+JNIEXPORT jlong JNICALL
+Java_org_androidaudioplugin_AudioPluginServiceHelper_getServiceInstanceNative(JNIEnv* env,
+                                                                              jclass,
+                                                                              jstring pluginId) {
+	std::string pluginIdString = jstringToStdString(env, pluginId);
+	auto svc = aap::PluginServiceList::getInstance()->findBoundServiceInProcess(pluginIdString.c_str());
+	return (jlong) (void*) svc;
+}
+
+extern "C"
+JNIEXPORT jlong JNICALL
+Java_org_androidaudioplugin_AudioPluginServiceHelper_getServiceInstanceForInstance(JNIEnv* env,
+                                                                                   jclass,
+                                                                                   jstring pluginId,
+                                                                                   jint instanceId) {
+    std::string pluginIdString = jstringToStdString(env, pluginId);
+    auto svc = aap::PluginServiceList::getInstance()->findBoundServiceInProcess(pluginIdString.c_str(), instanceId);
+    if (svc != nullptr)
+        return (jlong) (void*) svc;
+    svc = aap::PluginServiceList::getInstance()->findBoundServiceInProcess(pluginIdString.c_str());
+    return (jlong) (void*) svc;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_NativeLocalPluginInstance_getParameterCount(JNIEnv*,
+                                                                        jclass ,
+                                                                        jlong nativeService,
+                                                                        jint instanceId) {
+    return implPluginHostGetParameterCount(nativeService, instanceId);
+}
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_org_androidaudioplugin_NativeLocalPluginInstance_getParameter(JNIEnv *, jclass,
+                                                                            jlong nativeClient,
+                                                                            jint instanceId,
+                                                                            jint index) {
+	return aap::AAPJniFacade::getInstance()->getPluginInstanceParameter(nativeClient, instanceId, index);
+}
+
+extern "C"
+JNIEXPORT jdouble JNICALL
+Java_org_androidaudioplugin_NativeLocalPluginInstance_getParameterValue(JNIEnv*,
+                                                                        jclass,
+                                                                        jlong nativeService,
+                                                                        jint instanceId,
+                                                                        jint index) {
+    return implPluginHostGetParameterValue(nativeService, instanceId, index);
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_org_androidaudioplugin_NativeLocalPluginInstance_getPluginId(JNIEnv* env,
+                                                                   jclass ,
+                                                                   jlong nativeService,
+                                                                   jint instanceId) {
+    return env->NewStringUTF(implPluginHostGetPluginId(nativeService, instanceId).c_str());
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_NativeLocalPluginInstance_getPortCount(JNIEnv*,
+                                                                        jclass ,
+                                                                        jlong nativeService,
+                                                                        jint instanceId) {
+    return implPluginHostGetPortCount(nativeService, instanceId);
+}
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_org_androidaudioplugin_NativeLocalPluginInstance_getPort(JNIEnv *env,
+                                                              jclass ,
+                                                              jlong nativeService,
+                                                              jint instanceId,
+                                                              jint index) {
+	return aap::AAPJniFacade::getInstance()->getPluginInstancePort(nativeService, instanceId, index);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_NativeLocalPluginInstance_addEventUmpInput(JNIEnv *env, jclass clazz,
+                                                                       jlong nativeService,
+                                                                       jint instanceId,
+                                                                       jobject data, jint size) {
+    auto host = (aap::PluginService *) (void *) nativeService;
+    auto instance = host->getInstanceById(instanceId);
+    instance->addEventUmpInput(env->GetDirectBufferAddress(data), size);
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getParameterCount(JNIEnv *,
+																			jclass clazz,
+																			jlong nativeClient,
+																			jint instanceId) {
+    return implPluginHostGetParameterCount(nativeClient, instanceId);
+}
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getParameter(JNIEnv *, jclass ,
+																	   jlong nativeClient,
+																	   jint instanceId,
+																	   jint index) {
+	return aap::AAPJniFacade::getInstance()->getPluginInstanceParameter(nativeClient, instanceId, index);
+}
+
+extern "C"
+JNIEXPORT jdouble JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getParameterValue(JNIEnv*,
+                                                                                 jclass,
+                                                                                 jlong nativeClient,
+                                                                                 jint instanceId,
+                                                                                 jint index) {
+    return implPluginHostGetParameterValue(nativeClient, instanceId, index);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_setCachedParameterValue(JNIEnv*,
+                                                                                       jclass,
+                                                                                       jlong nativeClient,
+                                                                                       jint instanceId,
+                                                                                       jint index,
+                                                                                       jdouble value) {
+    auto host = (aap::PluginHost*) (void*) nativeClient;
+    auto instance = host->getInstanceById(instanceId);
+    if (instance)
+        aap::internal::setCachedParameterValue(*instance, index, value);
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getPortCount(JNIEnv *,
+                                                                            jclass ,
+                                                                            jlong nativeClient,
+                                                                            jint instanceId) {
+    return implPluginHostGetPortCount(nativeClient, instanceId);
+}
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getPort(JNIEnv *env, jclass ,
+																	   jlong nativeClient,
+																	   jint instanceId,
+																	   jint index) {
+	return aap::AAPJniFacade::getInstance()->getPluginInstancePort(nativeClient, instanceId, index);
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_applyBusLayout(JNIEnv *env, jclass,
+                                                                              jlong nativeClient,
+                                                                              jint instanceId,
+                                                                              jintArray ids,
+                                                                              jbooleanArray enabled,
+                                                                              jintArray channelCounts,
+                                                                              jobjectArray layouts) {
+    auto client = (aap::PluginClient*) (void*) nativeClient;
+    auto instance = dynamic_cast<aap::RemotePluginInstance*>(client->getInstanceById(instanceId));
+    if (!instance)
+        return env->NewStringUTF("instance not found");
+    aap_bus_layout_request_t request{};
+    request.count = std::min((int32_t) env->GetArrayLength(ids), (int32_t) AAP_MAX_BUSES);
+    for (jint i = 0; i < request.count; i++) {
+        jint id, channels;
+        jboolean isEnabled;
+        env->GetIntArrayRegion(ids, i, 1, &id);
+        env->GetBooleanArrayRegion(enabled, i, 1, &isEnabled);
+        env->GetIntArrayRegion(channelCounts, i, 1, &channels);
+        auto& bus = request.buses[i];
+        bus.id = (uint32_t) id;
+        bus.enabled = isEnabled;
+        bus.channel_count = channels;
+        auto layout = (jstring) env->GetObjectArrayElement(layouts, i);
+        if (layout) {
+            auto chars = env->GetStringUTFChars(layout, nullptr);
+            strncpy(bus.layout, chars, AAP_MAX_BUS_LAYOUT_CHARS - 1);
+            env->ReleaseStringUTFChars(layout, chars);
+        }
+    }
+    auto error = instance->applyBusLayout(request);
+    return error.empty() ? nullptr : env->NewStringUTF(error.c_str());
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getBusCount(JNIEnv *,
+                                                                           jclass ,
+                                                                           jlong nativeClient,
+                                                                           jint instanceId,
+                                                                           jint kind,
+                                                                           jint direction) {
+    auto host = (aap::PluginHost*) (void*) nativeClient;
+    auto instance = host->getInstanceById(instanceId);
+    return instance ? instance->getNumBuses((aap_bus_kind) kind, (aap_port_direction) direction) : 0;
+}
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getBus(JNIEnv *env, jclass ,
+                                                                      jlong nativeClient,
+                                                                      jint instanceId,
+                                                                      jint kind,
+                                                                      jint direction,
+                                                                      jint index) {
+    auto host = (aap::PluginHost*) (void*) nativeClient;
+    auto instance = host->getInstanceById(instanceId);
+    auto bus = instance ? instance->getBus((aap_bus_kind) kind, (aap_port_direction) direction, index) : nullptr;
+    if (!bus)
+        return nullptr;
+    auto klass = env->FindClass("org/androidaudioplugin/BusInformation");
+    auto ctor = env->GetMethodID(klass, "<init>", "(IIIILjava/lang/String;Ljava/lang/String;[I)V");
+    auto numIndices = bus->getKind() == AAP_BUS_KIND_AUDIO ? bus->getChannelCount() : 1;
+    auto portIndices = env->NewIntArray(numIndices);
+    for (jint i = 0; i < numIndices; i++) {
+        jint portIndex = bus->getPortIndex(i);
+        env->SetIntArrayRegion(portIndices, i, 1, &portIndex);
+    }
+    return env->NewObject(klass, ctor, (jint) bus->getId(), (jint) bus->getKind(),
+                          (jint) bus->getDirection(), (jint) bus->getRole(),
+                          env->NewStringUTF(bus->getName()), env->NewStringUTF(bus->getLayout()),
+                          portIndices);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_getPortBuffer(JNIEnv *env,
+		jclass clazz,
+		jlong nativeClient,
+		jint instanceId,
+		jint portIndex,
+        // Note that you will have to pass native buffer (using ByteBuffer.allocateDirecT()), otherwise ART crashes.
+		jobject buffer,
+		jint size) {
+	auto client = (aap::PluginClient*) (void*) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+    auto b = instance->getAudioPluginBuffer();
+	auto src = b->get_buffer(b, portIndex);
+    auto dst = env->GetDirectBufferAddress(buffer);
+	memcpy(dst, src, size);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_setPortBuffer(JNIEnv *env,
+		jclass clazz,
+		jlong nativeClient,
+		jint instanceId,
+		jint portIndex,
+        // Note that you will have to pass native buffer (using ByteBuffer.allocateDirecT()), otherwise ART crashes.
+		jobject buffer,
+		jint size) {
+	auto client = (aap::PluginClient *) (void *) nativeClient;
+	auto instance = client->getInstanceById(instanceId);
+    auto src = env->GetDirectBufferAddress(buffer);
+    auto b = instance->getAudioPluginBuffer();
+	auto dst = b->get_buffer(b, portIndex);
+	memcpy(dst, src, size);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_hosting_NativeRemotePluginInstance_00024Companion_sendExtensionRequest(
+        JNIEnv *env, jobject thiz, jlong nativeClient, jint instanceId, jstring uri,
+        jint opcode, jobject buffer, jint offset, jint length) {
+    auto client = (aap::PluginClient *) (void *) nativeClient;
+    auto instance = (aap::RemotePluginInstance*) client->getInstanceById(instanceId);
+    jboolean isCopy{false};
+    auto uriChars = env->GetStringUTFChars(uri, &isCopy);
+    auto src = (uint8_t*) env->GetDirectBufferAddress(buffer);
+    instance->sendPluginAAPXSRequest(0, uriChars, opcode, src + offset, length,
+                                     instance->aapxsRequestIdSerial());
+    if (isCopy)
+        env->ReleaseStringChars(uri, (const jchar*) uriChars);
+}
+
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_NativeLocalPluginInstance_getPresetCount(JNIEnv*,
+                                                                     jclass ,
+                                                                     jlong nativeService,
+                                                                     jint instanceId) {
+    auto service = (aap::PluginService *) (void *) nativeService;
+    auto instance = service->getInstanceById(instanceId);
+    const aap::internal::ProcessingQuiescence::Control suspension{instance->getRealtimeState().processing};
+    return (jint) instance->getStandardExtensions().getPresetCount();
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_org_androidaudioplugin_NativeLocalPluginInstance_getPresetName(JNIEnv* env,
+                                                                     jclass ,
+                                                                     jlong nativeService,
+                                                                     jint instanceId,
+                                                                     jint index) {
+    auto service = (aap::PluginService *) (void *) nativeService;
+    auto instance = service->getInstanceById(instanceId);
+    const aap::internal::ProcessingQuiescence::Control suspension{instance->getRealtimeState().processing};
+    std::string name = instance->getStandardExtensions().getPresetName(index);
+    return env->NewStringUTF(name.c_str());
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_NativeLocalPluginInstance_setPresetIndex(JNIEnv *env,
+                                                                    jclass clazz,
+                                                                    jlong nativeService,
+                                                                    jint instanceId, jint index) {
+    auto service = (aap::PluginService *) (void *) nativeService;
+    auto instance = service->getInstanceById(instanceId);
+    const aap::internal::ProcessingQuiescence::Control suspension{instance->getRealtimeState().processing};
+    instance->getStandardExtensions().setCurrentPresetIndex(index);
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_NativeLocalPluginInstance_readGuiListenerMidi2Output(JNIEnv *env,
+                                                                                 jclass clazz,
+                                                                                 jlong nativeService,
+                                                                                 jint instanceId,
+                                                                                 jobject buffer,
+                                                                                 jint size) {
+    if (!buffer || size <= 0)
+        return 0;
+    auto service = (aap::PluginService *) (void *) nativeService;
+    auto instance = static_cast<aap::LocalPluginInstance*>(service->getInstanceById(instanceId));
+    if (!instance)
+        return 0;
+    auto* output = env->GetDirectBufferAddress(buffer);
+    if (!output)
+        return 0;
+    return readLocalGuiListenerMidi2Output(instance, output, size);
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_ui_compose_ComposeAudioPluginView_readParameterOutput(JNIEnv *env,
+                                                                                  jobject thiz,
+                                                                                  jstring pluginId,
+                                                                                  jint instanceId,
+                                                                                  jobject buffer,
+                                                                                  jint size) {
+    if (!pluginId || !buffer || size <= 0)
+        return 0;
+    auto pluginIdString = jstringToStdString(env, pluginId);
+    auto service = aap::PluginServiceList::getInstance()->findBoundServiceInProcess(pluginIdString.c_str());
+    if (!service)
+        return 0;
+    auto instance = static_cast<aap::LocalPluginInstance*>(service->getInstanceById(instanceId));
+    if (!instance)
+        return 0;
+    auto* output = env->GetDirectBufferAddress(buffer);
+    if (!output)
+        return 0;
+    return readLocalGuiListenerMidi2Output(instance, output, size);
+}

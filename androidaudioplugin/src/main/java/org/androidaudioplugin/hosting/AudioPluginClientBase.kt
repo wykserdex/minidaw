@@ -1,0 +1,59 @@
+package org.androidaudioplugin.hosting
+
+import android.content.Context
+import android.media.AudioManager
+import org.androidaudioplugin.AudioPluginNatives
+import org.androidaudioplugin.AudioPluginException
+import org.androidaudioplugin.PluginInformation
+
+open class AudioPluginClientBase(private val context: Context) {
+    // Service connection
+    protected val serviceConnector by lazy { AudioPluginServiceConnector(context) }
+    protected val native by lazy { NativePluginClient.createFromConnection(serviceConnector.serviceConnectionId) }
+
+    val serviceConnectionId by lazy { serviceConnector.serviceConnectionId }
+
+    val onConnectedListeners by lazy { serviceConnector.onConnectedListeners }
+    val onDisconnectingListeners by lazy { serviceConnector.onDisconnectingListeners }
+
+    fun dispose() {
+        onDispose()
+        serviceConnector.connectedServices.toTypedArray().forEach { disconnectPluginService(it.serviceInfo.packageName) }
+        native.dispose()
+    }
+
+    open fun onDispose() {}
+
+    suspend fun connectToPluginService(packageName: String) : PluginServiceConnection {
+        val conn = serviceConnector.findExistingServiceConnection(packageName)
+        if (conn == null) {
+            val service = AudioPluginHostHelper.queryAudioPluginServices(context.applicationContext)
+                .first { c -> c.packageName == packageName }
+            return serviceConnector.bindAudioPluginService(service)
+        }
+        return conn
+    }
+
+    fun disconnectPluginService(packageName: String) {
+        val conn = serviceConnector.findExistingServiceConnection(packageName)
+        if (conn != null)
+            serviceConnector.unbindAudioPluginService(conn.serviceInfo.packageName)
+    }
+
+    fun instantiateNativePlugin(pluginInfo: PluginInformation) : NativeRemotePluginInstance {
+        val conn = serviceConnector.findExistingServiceConnection(pluginInfo.packageName)
+        if (conn == null)
+            throw AudioPluginException("Plugin service is not connected: ${pluginInfo.packageName}")
+        return native.createInstanceFromExistingConnection(pluginInfo.pluginId!!)
+    }
+
+    var sampleRate : Int
+
+    init {
+        AudioPluginNatives.initializeAAPJni(context.applicationContext)
+        InstalledPluginsMonitor.register(context)
+
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        sampleRate = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toInt() ?: 48000
+    }
+}

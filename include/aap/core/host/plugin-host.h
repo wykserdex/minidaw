@@ -1,0 +1,144 @@
+#ifndef AAP_CORE_PLUGIN_HOST_H
+#define AAP_CORE_PLUGIN_HOST_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dlfcn.h>
+#include <time.h>
+#include <unistd.h>
+#include <vector>
+#include <map>
+#include <string>
+#include <memory>
+#include "aap/android-audio-plugin.h"
+#include "aap/unstable/logging.h"
+#include "aap/ext/parameters.h"
+#include "aap/ext/presets.h"
+#include "aap/ext/state.h"
+#include "aap/ext/buses.h"
+#include "aap/ext/offline-rendering.h"
+#include "aap/plugin-meta-info.h"
+#include "plugin-connections.h"
+#include "plugin-instance.h"
+#include "../aapxs/extension-service.h"
+#include "../aapxs/standard-extensions.h"
+#include "../aapxs/aapxs-hosting-runtime.h"
+#include "../aapxs/result.h"
+
+namespace aap {
+
+    static constexpr int32_t DEFAULT_EVENT_MIDI2_INPUT_BUFFER_SIZE = DEFAULT_CONTROL_BUFFER_SIZE;
+
+    class PluginInstance;
+    class LocalPluginInstance;
+
+    class AudioPluginServiceCallback {
+    public:
+        virtual ~AudioPluginServiceCallback() {}
+
+        virtual void hostExtension(int32_t in_instanceId,
+                                   const std::string& in_uri,
+                                   int32_t in_opcode,
+                                   int32_t in_requestId,
+                                   void* callback) = 0;
+        virtual void requestProcess(int32_t in_instanceId) = 0;
+    };
+
+/* Common foundation for both Plugin service and Plugin client to provide common features:
+ *
+ * - retrieve AAPXSFeature*
+ * - manage plugins (instantiate and destroy) within either a client (to multiple service connections)
+ *   or a service (to multiple client connections)
+ *
+ */
+    class PluginHost
+    {
+    protected:
+        xs::AAPXSDefinitionRegistry* aapxs_definition_registry{nullptr};
+        PluginListSnapshot* plugin_list{nullptr};
+
+        std::vector<PluginInstance*> instances{};
+        PluginInstance* instantiateLocalPlugin(const PluginInformation *pluginInfo);
+        int32_t event_midi2_input_buffer_size{DEFAULT_EVENT_MIDI2_INPUT_BUFFER_SIZE};
+
+    public:
+        PluginHost(PluginListSnapshot* contextPluginList,
+                   xs::AAPXSDefinitionRegistry* aapxsDefinitionRegistry,
+                   int32_t eventMidi2InputBufferSize = DEFAULT_EVENT_MIDI2_INPUT_BUFFER_SIZE);
+
+        virtual ~PluginHost() {}
+
+        void destroyInstance(PluginInstance* instance);
+
+        size_t getInstanceCount() { return instances.size(); }
+
+        // Note that the argument is NOT instanceId
+        PluginInstance* getInstanceByIndex(int32_t index);
+
+        PluginInstance* getInstanceById(int32_t instanceId);
+
+        bool hasPlugin(const std::string& pluginId) const {
+            return plugin_list && plugin_list->getPluginInformation(pluginId) != nullptr;
+        }
+    };
+
+
+    class PluginService : public PluginHost {
+        AudioPluginServiceCallback* plugin_service_callback;
+    public:
+        PluginService(PluginListSnapshot* contextPluginList, AudioPluginServiceCallback* callback, xs::AAPXSDefinitionRegistry* aapxsDefinitionRegistry = nullptr)
+                : PluginHost(contextPluginList,
+                             aapxsDefinitionRegistry),
+                  plugin_service_callback(callback)
+        {
+        }
+
+        int createInstance(std::string identifier);
+
+        inline LocalPluginInstance* getLocalInstance(int32_t instanceId) {
+            return (LocalPluginInstance*) getInstanceById(instanceId);
+        }
+
+        void requestProcessToHost(int32_t instanceId) {
+            plugin_service_callback->requestProcess(instanceId);
+        }
+    };
+
+    class PluginClient : public PluginHost {
+        PluginClientConnectionList* connections;
+
+        // Result<T> is the shared aap::Result<T> (include/aap/core/aapxs/result.h);
+        // kept as a member alias so existing `PluginClient::Result<...>` references stay valid.
+        template<typename T>
+        using Result = aap::Result<T>;
+
+        Result<int32_t> instantiateRemotePlugin(const PluginInformation *pluginInfo);
+
+    public:
+        PluginClient(PluginClientConnectionList* pluginConnections, PluginListSnapshot* contextPluginList, xs::AAPXSDefinitionRegistry* aapxsDefinitionRegistry = nullptr)
+                : PluginHost(contextPluginList,
+                             aapxsDefinitionRegistry),
+                  connections(pluginConnections)
+        {
+        }
+
+        inline PluginClientConnectionList* getConnections() { return connections; }
+
+        // Looks up the plugin from the installed plugins list, refreshing it when plugin packages
+        // were changed. Returns nullptr if the plugin is not installed.
+        const PluginInformation* findPluginInformation(const std::string& identifier);
+
+        // Synchronous version that does not expect service connection on the fly (fails immediately).
+        // It is probably better suited for Kotlin client to avoid complicated JNI interop.
+        Result<int32_t> createInstance(std::string identifier, bool isRemoteExplicit);
+
+        void connectToPluginService(const std::string& identifier, std::function<void(std::string&)> callback);
+
+        void connectToPluginService(const std::string& packageName, const std::string& className, std::function<void(std::string&)> callback);
+    };
+
+} // namespace
+
+
+#endif //AAP_CORE_PLUGIN_HOST_H

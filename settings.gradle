@@ -1,0 +1,27 @@
+pluginManagement {
+    repositories {
+        google()
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+dependencyResolutionManagement {
+    repositories {
+        mavenLocal()
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'aap-core'
+include ':androidaudioplugin'
+include ':androidaudioplugin-midi-device-service'
+include ':androidaudioplugin-ui-compose'
+include ':androidaudioplugin-ui-compose-app'
+include ':androidaudioplugin-manager'
+include ':androidaudioplugin-ui-web'
+include ':androidaudioplugin-js-controller'
+include ':samples:aappluginsample'
+include ':samples:aaphostsample'
+include ':samples:minidahost'
+include ':androidaudioplugin-testing'

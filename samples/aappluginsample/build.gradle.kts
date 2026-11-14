@@ -1,0 +1,78 @@
+plugins {
+    id ("com.android.application")
+}
+
+apply { from ("../../common.gradle") }
+
+android {
+    namespace = "org.androidaudioplugin.aapinstrumentsample"
+    defaultConfig {
+        applicationId = "org.androidaudioplugin.aapinstrumentsample"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments ("-DANDROID_STL=c++_shared")
+            }
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            version = libs.versions.cmake.get()
+            path ("src/main/cpp/CMakeLists.txt")
+        }
+    }
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles (getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
+    packaging {
+        resources {
+            excludes += setOf("META-INF/AL2.0", "META-INF/LGPL2.1")
+        }
+    }
+
+    // FIXME: it is annoying to copy this everywhere, but publish-pom.gradle.kts is incapable of importing this fragment...
+    // It's been long time until I got this working, and I have no idea why it started working.
+    //  If you don't get this working, you are not alone: https://github.com/atsushieno/aap-core/issues/85
+    // Also note that you have to use custom sdk channel so far: ./gradlew testDevice1DebugAndroidTest -Pandroid.sdk.channel=3
+    testOptions {
+        managedDevices {
+            localDevices {
+                maybeCreate("testDevice1").apply {
+                    device = "Resizable (Experimental)"
+                    apiLevel = 36
+                    systemImageSource = "aosp-atd"
+                }
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation (project(":androidaudioplugin"))
+    implementation (project(":androidaudioplugin-ui-compose"))
+    implementation (project(":androidaudioplugin-ui-compose-app"))
+    implementation (project(":androidaudioplugin-ui-web"))
+    implementation (project(":androidaudioplugin-midi-device-service"))
+    androidTestImplementation (project(":androidaudioplugin-testing"))
+    implementation (libs.androidx.core.ktx)
+    implementation (libs.kotlin.stdlib.jdk8)
+    implementation (libs.androidx.appcompat)
+
+    testImplementation (libs.junit)
+    androidTestImplementation (libs.test.ext.junit)
+    androidTestImplementation (libs.test.espresso.core)
+}
+
+// Starting AGP 7.0.0-alpha05, AGP stopped caring build dependencies and it broke builds.
+// This is a forcible workarounds to build libandroidaudioplugin.so in prior to referencing it.
+gradle.projectsEvaluated {
+    tasks["buildCMakeDebug"].dependsOn(rootProject.project("androidaudioplugin").tasks["mergeDebugNativeLibs"])
+    tasks["buildCMakeRelWithDebInfo"].dependsOn(rootProject.project("androidaudioplugin").tasks["mergeReleaseNativeLibs"])
+}

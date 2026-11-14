@@ -1,0 +1,459 @@
+package org.androidaudioplugin.ui.compose.app
+
+import android.os.Build
+import android.util.Log
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.google.accompanist.permissions.ExperimentalPermissionsApi
+import org.androidaudioplugin.BusInformation
+import org.androidaudioplugin.PluginInformation
+import org.androidaudioplugin.PortInformation
+import org.androidaudioplugin.hosting.AudioPluginMidiSettings
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalPermissionsApi::class)
+@Composable
+fun PluginDetails(pluginInfo: PluginInformation, manager: PluginManagerScope) {
+    // PluginDetailsScope.create() involves suspend fun, so we replace the Composable once it's ready.
+    val info = remember { pluginInfo }
+    val scope = remember { PluginDetailsScope(info, manager) }
+    val instance by remember { scope.instance }
+
+    LaunchedEffect(scope) {
+        scope.instantiatePlugin()
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            scope.close()
+        }
+    }
+
+    if (instance == null)
+        PluginDetailsInstancing(info)
+    else
+        PluginDetailsInstantiated(scope)
+}
+
+@Composable
+fun PluginDetailsInstancing(pluginInfo: PluginInformation) {
+    Text("Instantiating ${pluginInfo.displayName} ...")
+    PluginMetadata(pluginInfo)
+    PluginPortList(pluginInfo.ports)
+}
+
+@Composable
+fun PluginDetailsInstantiated(scope: PluginDetailsScope) {
+    val pluginInfo = scope.pluginInfo
+    val context = LocalContext.current
+    val isProcessing by scope.isProcessing
+
+    var showWebUI by remember { mutableStateOf(false) }
+    var showSurfaceUI by remember { mutableStateOf(false) }
+    var surfaceUIConnected by remember { mutableStateOf(false) }
+    val instance = scope.instance.value!!
+    var surfaceUIScope by remember { mutableStateOf<SurfaceControlUIScope?>(null) }
+    val closeSurfaceUI = {
+        showSurfaceUI = false
+        surfaceUIConnected = false
+        surfaceUIScope?.close()
+        surfaceUIScope = null
+    }
+    val saveStateLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        if (uri == null)
+            return@rememberLauncherForActivityResult
+        runCatching {
+            context.contentResolver.openOutputStream(uri)?.use {
+                scope.saveStateTo(it)
+            }
+        }.onFailure {
+            Log.e("AAPPluginManager", "Failed to save plugin state", it)
+        }
+    }
+    val loadStateLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri == null)
+            return@rememberLauncherForActivityResult
+        runCatching {
+            context.contentResolver.openInputStream(uri)?.use {
+                scope.loadStateFrom(it)
+            }
+        }.onFailure {
+            Log.e("AAPPluginManager", "Failed to load plugin state", it)
+        }
+    }
+
+    LaunchedEffect(scope, isProcessing) {
+        while (true) {
+            withFrameNanos { }
+            scope.syncParametersFromInstance()
+            if (isProcessing)
+                scope.drainMidiOutput()
+        }
+    }
+
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val density = LocalDensity.current
+        val surfaceWidth = (maxWidth - 32.dp).coerceAtLeast(1.dp)
+        val surfaceHeight = (maxHeight - 84.dp).coerceAtLeast(1.dp)
+        val contentWidth = surfaceWidth.coerceAtLeast(866.dp)
+        val contentHeight = surfaceHeight.coerceAtLeast(674.dp)
+        val contentWidthPx = with(density) { contentWidth.roundToPx() }
+        val contentHeightPx = with(density) { contentHeight.roundToPx() }
+        // The parameter list is a scrollable grid nested within this scrollable Column, so it
+        // needs its own bounded height; cap it so it can never dominate the whole screen.
+        val parameterListMaxHeight = maxHeight / 2
+
+        // We show the Web UI and the native UI *outside* any of the sequential layout contexts e.g.
+        // Column() or Row(), so we have WebUI and SurfaceControl UI on top level along with the main content.
+        //
+        // Their visibility state (showXxxUI) affects the content of PluginInstanceControl() so they
+        // have to be passed to the composable, along with onXxxChanged handlers...
+        Column(Modifier.verticalScroll(rememberScrollState())) {
+            PluginMetadata(pluginInfo)
+            val buses = listOf(BusInformation.BUS_KIND_AUDIO, BusInformation.BUS_KIND_EVENT).flatMap { kind ->
+                listOf(PortInformation.PORT_DIRECTION_INPUT, PortInformation.PORT_DIRECTION_OUTPUT).flatMap { direction ->
+                    (0 until instance.getBusCount(kind, direction)).mapNotNull { instance.getBus(kind, direction, it) }
+                }
+            }
+            PluginBusList(buses)
+            val ports = (0 until instance.getPortCount()).map { instance.getPort(it) }
+            PluginPortList(ports)
+
+            PluginInstanceControl(
+                scope, pluginInfo, instance, parameterListMaxHeight
+            )
+
+            Row {
+                Button(onClick = {
+                    showWebUI = !showWebUI
+                }) {
+                    Text(if (showWebUI) "Hide Web UI" else "Show Web UI")
+                }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    Button(onClick = {
+                        if (showSurfaceUI)
+                            closeSurfaceUI()
+                        else
+                            showSurfaceUI = true
+                    }) {
+                        Text(if (showSurfaceUI) "Hide Native UI" else "Show Native UI")
+                    }
+                }
+            }
+            Row {
+                Button(onClick = {
+                    val stateName = "${pluginInfo.displayName}.aapstate"
+                    saveStateLauncher.launch(stateName)
+                }) {
+                    Text("Save State")
+                }
+                Button(onClick = {
+                    loadStateLauncher.launch(arrayOf("*/*"))
+                }) {
+                    Text("Load State")
+                }
+            }
+        }
+
+        if (showWebUI)
+            PluginWebUI(pluginInfo.packageName, pluginInfo.pluginId!!, instance, scope.parameterValues,
+                onCloseClick = { showWebUI = false })
+
+        if (showSurfaceUI) {
+            val uiScope = surfaceUIScope
+            if (uiScope == null) {
+                LaunchedEffect(scope, contentWidthPx, contentHeightPx) {
+                    surfaceUIScope = SurfaceControlUIScope.create(scope, contentWidthPx, contentHeightPx)
+                }
+            } else {
+                var currentContentWidthPx by remember(uiScope) { mutableStateOf(uiScope.width) }
+                var currentContentHeightPx by remember(uiScope) { mutableStateOf(uiScope.height) }
+                val surfaceContentWidth = with(density) { currentContentWidthPx.toDp() }
+                val surfaceContentHeight = with(density) { currentContentHeightPx.toDp() }
+                val initialViewportWidth = surfaceContentWidth.coerceAtMost(surfaceWidth)
+                val initialViewportHeight = surfaceContentHeight.coerceAtMost(surfaceHeight)
+                var currentViewportWidthPx by remember(uiScope) { mutableStateOf(with(density) { initialViewportWidth.roundToPx() }) }
+                var currentViewportHeightPx by remember(uiScope) { mutableStateOf(with(density) { initialViewportHeight.roundToPx() }) }
+                val surfaceViewportWidth = with(density) { currentViewportWidthPx.toDp() }
+                val surfaceViewportHeight = with(density) { currentViewportHeightPx.toDp() }
+
+                DisposableEffect(uiScope) {
+                    val listener: (Int, Int) -> Unit = { w, h ->
+                        currentContentWidthPx = w
+                        currentContentHeightPx = h
+                        // When content shrinks below the current viewport, shrink the viewport to match.
+                        // This handles plugin-initiated resizes (e.g. zoom level changes).
+                        if (currentViewportWidthPx > w) currentViewportWidthPx = w
+                        if (currentViewportHeightPx > h) currentViewportHeightPx = h
+                    }
+                    uiScope.guiHost?.contentSizeChangedListeners?.add(listener)
+                    onDispose {
+                        uiScope.guiHost?.contentSizeChangedListeners?.remove(listener)
+                        uiScope.close()
+                    }
+                }
+
+                // We can call this composable only after we create the SurfaceControl client.
+                PluginSurfaceControlUI(
+                    pluginInfo,
+                    viewportWidth = surfaceViewportWidth,
+                    viewportHeight = surfaceViewportHeight,
+                    contentWidth = surfaceContentWidth,
+                    contentHeight = surfaceContentHeight,
+                    createSurfaceView = { _ -> uiScope.guiHost!!.surfaceView },
+                    detachSurfaceView = { _ -> },
+                    onViewportChanged = { viewportWidth, viewportHeight, contentWidth, contentHeight, scrollX, scrollY ->
+                        if (surfaceUIConnected) {
+                            uiScope.configureSurfaceGUIViewport(
+                                viewportWidth,
+                                viewportHeight,
+                                contentWidth,
+                                contentHeight,
+                                scrollX,
+                                scrollY
+                            )
+                        }
+                    },
+                    onResize = { newWidth, newHeight ->
+                        currentViewportWidthPx = newWidth
+                        currentViewportHeightPx = newHeight
+                    },
+                    onCloseClick = { closeSurfaceUI() })
+
+                if (!surfaceUIConnected) {
+                    LaunchedEffect(uiScope) {
+                        // Connection has to be established only after AndroidView is added to the view tree
+                        // and displayId becomes available.
+                        uiScope.connectSurfaceControlUI()
+                        surfaceUIConnected = true
+                    }
+                }
+
+            }
+        }
+    }
+}
+
+private val headerModifier = Modifier.width(120.dp)
+
+@Composable
+private fun ColumnHeader(text: String) {
+    Text(modifier = headerModifier, fontWeight = FontWeight.Bold, text = text)
+}
+
+@Composable
+fun PluginMetadata(pluginInfo: PluginInformation) {
+    var pluginDetailsExpanded by remember { mutableStateOf(false) }
+
+    Row {
+        Text(text = (if (pluginDetailsExpanded) "[-]" else "[+]") + " details", fontSize = 20.sp, modifier = Modifier
+            .padding(vertical = 12.dp)
+            .clickable {
+                pluginDetailsExpanded = !pluginDetailsExpanded
+            })
+    }
+    if (pluginDetailsExpanded) {
+        Row {
+            ColumnHeader("package: ")
+        }
+        Row {
+            Text(pluginInfo.packageName, fontSize = 14.sp)
+        }
+        Row {
+            ColumnHeader("classname: ")
+        }
+        Row {
+            Text(pluginInfo.localName, fontSize = 14.sp)
+        }
+        if (pluginInfo.developer != null) {
+            Row {
+                ColumnHeader("developer: ")
+            }
+            Row {
+                Text(pluginInfo.developer ?: "")
+            }
+        }
+
+        Text(text = "Extensions", fontSize = 20.sp, modifier = Modifier.padding(vertical = 12.dp))
+        Column {
+            for (extension in pluginInfo.extensions) {
+                Row(modifier = Modifier.border(1.dp, Color.LightGray)) {
+                    Text(
+                        (if (extension.required) "[req]" else "[opt]") + " " + (extension.uri
+                            ?: "(uri unspecified)"), fontSize = 12.sp
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MidiSettings(midiSettingsFlags: Int, midiSeetingsFlagsChanged: (Int) -> Unit) {
+    var midiSettingsExpanded by remember { mutableStateOf(false) }
+
+    Text(text = (if (midiSettingsExpanded) "[-]" else "[+]") + " Parameter MIDI mapping policy", fontSize = 20.sp, modifier = Modifier
+        .padding(vertical = 12.dp)
+        .clickable {
+            midiSettingsExpanded = !midiSettingsExpanded
+        })
+    if (midiSettingsExpanded) {
+        Column {
+            Row {
+                Checkbox(
+                    enabled = false,
+                    checked = (midiSettingsFlags and AudioPluginMidiSettings.AAP_PARAMETERS_MAPPING_POLICY_PROGRAM) != 0,
+                    onCheckedChange = {
+                        val v = midiSettingsFlags xor AudioPluginMidiSettings.AAP_PARAMETERS_MAPPING_POLICY_PROGRAM
+                        midiSeetingsFlagsChanged(v)
+                    })
+                Text("Consumes Program Changes by its own")
+            }
+            Row {
+                Checkbox(
+                    enabled = false,
+                    checked = (midiSettingsFlags and AudioPluginMidiSettings.AAP_PARAMETERS_MAPPING_POLICY_CC) != 0,
+                    onCheckedChange = {
+                        val v = midiSettingsFlags xor AudioPluginMidiSettings.AAP_PARAMETERS_MAPPING_POLICY_CC
+                        midiSeetingsFlagsChanged(v)
+                    })
+                Text("Consumes CCs by its own")
+            }
+            Row {
+                Checkbox(
+                    enabled = false,
+                    checked = (midiSettingsFlags and AudioPluginMidiSettings.AAP_PARAMETERS_MAPPING_POLICY_ACC) != 0,
+                    onCheckedChange = {
+                        val v = midiSettingsFlags xor AudioPluginMidiSettings.AAP_PARAMETERS_MAPPING_POLICY_ACC
+                        midiSeetingsFlagsChanged(v)
+                    })
+                Text("Consumes NRPNs (ACCs) by its own")
+            }
+            Row {
+                Checkbox(
+                    enabled = false,
+                    checked = (midiSettingsFlags and AudioPluginMidiSettings.AAP_PARAMETERS_MAPPING_POLICY_SYSEX8) != 0,
+                    onCheckedChange = {
+                        val v = midiSettingsFlags xor AudioPluginMidiSettings.AAP_PARAMETERS_MAPPING_POLICY_SYSEX8
+                        midiSeetingsFlagsChanged(v)
+                    })
+                Text("Consumes SysEx8 by its own")
+            }
+        }
+    }
+}
+
+@Composable
+fun PluginBusList(buses: List<BusInformation>, modifier: Modifier = Modifier) {
+    var busListExpanded by remember { mutableStateOf(false) }
+
+    Text(text = (if (busListExpanded) "[-]" else "[+]") + " Buses", fontSize = 20.sp, modifier = Modifier
+        .padding(vertical = 12.dp)
+        .clickable {
+            busListExpanded = !busListExpanded
+        })
+
+    if (!busListExpanded)
+        return
+
+    Column {
+        for (bus in buses) {
+            Row(modifier = Modifier.border(1.dp, Color.LightGray)) {
+                Column {
+                    Text(
+                        fontSize = 14.sp,
+                        text = when (bus.direction) {
+                            PortInformation.PORT_DIRECTION_INPUT -> "In"
+                            else -> "Out"
+                        } + if (bus.role == BusInformation.BUS_ROLE_MAIN) "" else " (aux)",
+                        modifier = Modifier.width(80.dp)
+                    )
+                    Text(
+                        fontSize = 14.sp,
+                        text = when (bus.kind) {
+                            BusInformation.BUS_KIND_AUDIO -> "Audio ${bus.layout}"
+                            else -> "Event"
+                        },
+                        modifier = Modifier.width(80.dp)
+                    )
+                }
+                ColumnHeader(bus.name + " (ports: " + bus.portIndices.joinToString(", ") + ")")
+            }
+        }
+    }
+}
+
+@Composable
+fun PluginPortList(instancePorts: List<PortInformation>, modifier: Modifier = Modifier) {
+    var portListExpanded by remember { mutableStateOf(false) }
+
+    Text(text = (if (portListExpanded) "[-]" else "[+]") + " Ports", fontSize = 20.sp, modifier = Modifier
+        .padding(vertical = 12.dp)
+        .clickable {
+            portListExpanded = !portListExpanded
+        })
+
+    if (!portListExpanded)
+        return
+
+    Column {
+        for (port in instancePorts) {
+            Row(modifier = Modifier.border(1.dp, Color.LightGray)) {
+                Column {
+                    Text(
+                        fontSize = 14.sp,
+                        text = "[${port.index}] " + when (port.direction) {
+                            PortInformation.PORT_DIRECTION_INPUT -> "In"
+                            else -> "Out"
+                        },
+                        modifier = Modifier.width(60.dp)
+                    )
+                    Text(
+                        fontSize = 14.sp,
+                        text = when (port.content) {
+                            PortInformation.PORT_CONTENT_TYPE_AUDIO -> "Audio"
+                            PortInformation.PORT_CONTENT_TYPE_MIDI -> "MIDI"
+                            PortInformation.PORT_CONTENT_TYPE_MIDI2 -> "MIDI2"
+                            else -> "-"
+                        },
+                        modifier = Modifier.width(60.dp)
+                    )
+                }
+                ColumnHeader(port.name)
+            }
+        }
+    }
+}

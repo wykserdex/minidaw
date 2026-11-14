@@ -1,0 +1,200 @@
+package org.androidaudioplugin
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import android.os.Looper
+import androidx.core.app.NotificationCompat
+
+/**
+ * The Audio plugin service class. It should not be derived. We check the service class name strictly.
+ *
+ * Every AAP should implement AudioPluginInterface.aidl, in native code.
+ *
+ * Typical user developers don't have to write any code to create their own plugins in Kotlin code.
+ * They are implemented in native code to get closest to realtime audio processing.
+ */
+open class AudioPluginService : Service()
+{
+    companion object {
+        const val EXTRA_REQUEST_FOREGROUND = "org.androidaudioplugin.extra.REQUEST_FOREGROUND"
+        private var initialized = false
+        private var waitForDebugger = false
+
+        fun initialize(context: Context) {
+            if (initialized)
+                return
+            if (waitForDebugger) {
+                android.os.Debug.waitForDebugger()
+                waitForDebugger = true
+            }
+            AudioPluginNatives.initializeAAPJni(context)
+            initialized = true
+        }
+    }
+
+    /**
+     * This interface is used by AAP Service extensions that will be initialized at onCreate().
+     * Not to be confused with AAP extension in the native (audio plugin) API context (`get_extension()`).
+     *
+     * By registering this extension as a `<meta-data>` element in AndroidManifest.xml, whose
+     * `android:name` is `org.androidaudioplugin.AudioPluginService#Extensions`, the implementation
+     * class that is specified in the `android:value` attribute of the `<meta-data>` element
+     * will be instantiated and those members are invoked, wherever appropriate.
+     */
+    interface Extension {
+        fun initialize(ctx: Context)
+        fun cleanup()
+    }
+
+    private var nativeBinder : IBinder? = null
+    var extensions = mutableListOf<Extension>()
+    private val notificationManager by lazy { getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager }
+    private val CHANNEL_ID by lazy { applicationInfo.packageName + ":" + javaClass.name }
+    private val NOTIFICATION_ID by lazy { CHANNEL_ID.hashCode() }
+    private var mayStartForeground = false
+    private var isForegroundStarted = false
+
+    override fun onCreate() {
+        initialize(this)
+
+        createNotificationChannel()
+
+        val si = AudioPluginServiceHelper.getLocalAudioPluginService(this)
+        si.extensions.forEach { e ->
+            if(e == "")
+                return@forEach
+            val c = Class.forName(e)
+            val ext = c.newInstance() as Extension
+            ext.initialize(this)
+            extensions.add(ext)
+        }
+    }
+
+    override fun onDestroy() {
+        stopForegroundServiceIfStarted()
+
+        for (ext in extensions)
+            ext.cleanup()
+        extensions.clear()
+
+        super.onDestroy()
+    }
+
+    private var eventProcessorLooper: Looper? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        updateForegroundEligibility(intent)
+        maybeStartForegroundService()
+        return START_NOT_STICKY
+    }
+
+    override fun onRebind(intent: Intent?) {
+        updateForegroundEligibility(intent)
+        maybeStartForegroundService()
+        super.onRebind(intent)
+    }
+
+    override fun onBind(intent: Intent?): IBinder? {
+        updateForegroundEligibility(intent)
+        maybeStartForegroundService()
+
+        val existing = nativeBinder
+        if (existing != null)
+            return existing
+
+        nativeBinder = AudioPluginNatives.createBinderForService()
+
+        // no need to worry about the Looper retaining; it will be released at onUnbind()
+        Thread {
+            AudioPluginNatives.prepareNativeLooper()
+            eventProcessorLooper = Looper.myLooper()
+            AudioPluginNatives.startNativeLooper()
+        }.apply {
+            this.contextClassLoader = contextClassLoader
+            this.start()
+        }
+        return nativeBinder
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        stopForegroundServiceIfStarted()
+
+        AudioPluginNatives.stopNativeLooper()
+        if (eventProcessorLooper?.thread?.isAlive == true)
+            eventProcessorLooper?.quitSafely()
+        eventProcessorLooper = null
+
+        val binder = nativeBinder
+        if (binder != null)
+            AudioPluginNatives.destroyBinderForService(binder)
+        nativeBinder = null
+
+        return true
+    }
+    
+    private fun createNotificationChannel() {
+        val name = applicationInfo.packageName
+        val descriptionText = getString(R.string.audio_plugin_service_notification_channel_description)
+        val importance = NotificationManager.IMPORTANCE_LOW
+        val channel = NotificationChannel(CHANNEL_ID, name, importance).apply {
+            description = descriptionText
+        }
+        notificationManager.createNotificationChannel(channel)
+    }
+
+    private fun updateForegroundEligibility(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_REQUEST_FOREGROUND, false) == true) {
+            mayStartForeground = true
+        }
+    }
+    
+    private fun maybeStartForegroundService() {
+        if (!mayStartForeground || isForegroundStarted)
+            return
+
+        val notification = createNotification()
+        try {
+            startForeground(NOTIFICATION_ID, notification,
+                AudioPluginServiceHelper.getForegroundServiceType(this, packageName, javaClass.name))
+            isForegroundStarted = true
+        } catch (ex: Exception) {
+            if (isForegroundStartNotAllowed(ex)) {
+                mayStartForeground = false
+                android.util.Log.w("AAP.Hosting", "Foreground service start not allowed; continuing as bound service", ex)
+            } else {
+                android.util.Log.e("AAP.Hosting", "Failed to start as foreground service", ex)
+            }
+        }
+    }
+
+    private fun isForegroundStartNotAllowed(ex: Exception): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            ex is android.app.ForegroundServiceStartNotAllowedException
+    }
+
+    private fun stopForegroundServiceIfStarted() {
+        if (!isForegroundStarted)
+            return
+
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        isForegroundStarted = false
+    }
+    
+    private fun createNotification(): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            // It may be confusing if there are more than one AudioPluginService...
+            .setContentTitle("AAP: " + applicationInfo.packageName)
+            .setContentText(getString(R.string.audio_plugin_service_notification_text))
+            // FIXME: this should become customizable and identifiable
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setOngoing(true)
+            .build()
+    }
+}
