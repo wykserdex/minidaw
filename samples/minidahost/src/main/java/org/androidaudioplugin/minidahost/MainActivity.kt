@@ -1,6 +1,5 @@
 package org.androidaudioplugin.minidahost
 
-import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
@@ -26,6 +25,8 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.addCallback
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -62,7 +63,7 @@ private const val PICK_KIT_ZIP = 2
 private const val PICK_KIT_FOLDER = 3
 private const val MAX_AUDIO_BYTES = 32 * 1024 * 1024
 
-class MainActivity : Activity() {
+class MainActivity : ComponentActivity() {
     private class Device(val info: PluginInformation, val instance: NativeRemotePluginInstance,
                          val group: Int, val parameters: MutableMap<Int, Double>) {
         val ayumi = info.pluginId == "urn:org.androidaudioplugin/samples/aappluginsample/InstrumentSample"
@@ -174,6 +175,9 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Back closes the topmost panel, then returns to the project list. Registered through the
+        // dispatcher so the predictive-back gesture on Android 13+ reaches it.
+        onBackPressedDispatcher.addCallback(this) { handleBack() }
         actionBar?.hide()
         Flm.applyTheme(prefs.getInt("theme", 0))
         showKeyNames = prefs.getBoolean("keyNames", true)
@@ -2151,10 +2155,9 @@ class MainActivity : Activity() {
         processing = false; stopping = false; recording = false
     }
 
-    @Deprecated("Deprecated in Android")
-    override fun onBackPressed() {
+    private fun handleBack() {
         if (loading || stopping) return
-        if (project == null) { super.onBackPressed(); return }
+        if (project == null) { finish(); return }
         if (devicesOpen) { toggleDevices(); return }
         if (mixerOpen) { setMixerOpen(false); return }
         if (rollOpen) { closeRoll(); return }

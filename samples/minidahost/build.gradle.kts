@@ -41,6 +41,7 @@ dependencies {
     implementation (project(":androidaudioplugin"))
     implementation (project(":androidaudioplugin-manager"))
     implementation (libs.androidx.core.ktx)
+    implementation (libs.androidx.activity)
     implementation (libs.kotlin.stdlib.jdk8)
     implementation (libs.coroutines.core)
     implementation (libs.coroutines.android)
