@@ -49,7 +49,7 @@ data class ProjectEffect(
 
 data class DawProject(
     val id: String = UUID.randomUUID().toString(),
-    val name: String,
+    var name: String,
     var bpm: Int = 140,
     var masterGain: Float = 1f,
     var masterMuted: Boolean = false,

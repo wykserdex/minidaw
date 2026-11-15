@@ -8,6 +8,7 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.media.AudioManager
 import android.media.MediaPlayer
+import android.media.SoundPool
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -41,11 +42,16 @@ import org.androidaudioplugin.hosting.AudioPluginHostHelper
 import org.androidaudioplugin.hosting.NativeRemotePluginInstance
 import org.androidaudioplugin.hosting.UmpHelper
 import org.androidaudioplugin.manager.PluginPlayer
+import java.io.File
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
+import kotlin.math.exp
 import kotlin.math.floor
 import kotlin.math.log10
+import kotlin.math.roundToInt
+import kotlin.math.sin
 
 private const val DEFAULT_CONTROL_BYTES_PER_BLOCK = 0x10000
 private const val NOTE_VELOCITY_16 = 12000
@@ -103,6 +109,11 @@ class MainActivity : Activity() {
     private var mixerOpen = false
     private var devicesOpen = false
     private var recording = false
+    private var metronomeOn = false
+    private var soundPool: SoundPool? = null
+    private var clickSound = 0
+    private var accentSound = 0
+    private val tapTimes = ArrayDeque<Long>()
     private var position = 0.0
     private var lastFrames = 0L
     private var scheduledStep = 0L
@@ -148,7 +159,6 @@ class MainActivity : Activity() {
     private lateinit var mixerButton: Button
     private lateinit var devicesButton: Button
     private lateinit var undoButton: Button
-    private lateinit var themeButton: Button
     private lateinit var drumButton: Button
     private lateinit var padsButton: Button
     private lateinit var namesButton: Button
@@ -167,6 +177,7 @@ class MainActivity : Activity() {
         actionBar?.hide()
         Flm.applyTheme(prefs.getInt("theme", 0))
         showKeyNames = prefs.getBoolean("keyNames", true)
+        prepareClicks()
         ghostNotes = prefs.getBoolean("ghost", true)
         pendingAudioTrack = savedInstanceState?.getString("pendingAudioTrack")
         pendingAudioUri = savedInstanceState?.getString("pendingAudioUri")?.let { Uri.parse(it) }
@@ -202,7 +213,7 @@ class MainActivity : Activity() {
     private fun showProjects() {
         val root = rootLayout().apply { setPadding(dp(28), dp(16), dp(28), dp(16)) }
         val header = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        header.addView(label("MiniDAW  /  Projects", 20f).apply { setTextColor(Flm.text) },
+        header.addView(label("Floton  /  Projects", 20f).apply { setTextColor(Flm.text) },
             LinearLayout.LayoutParams(0, dp(48), 1f))
         header.addView(button("NEW PROJECT") { newProjectDialog() }, LinearLayout.LayoutParams(dp(148), dp(38)))
         root.addView(header)
@@ -213,7 +224,7 @@ class MainActivity : Activity() {
             val projects = store.list()
             if (projects.isEmpty()) list.addView(label("No saved projects", 14f))
             projects.forEach { saved ->
-                list.addView(button("${saved.name}   ·   ${saved.tracks.size} tracks   ·   ${saved.bpm} BPM") {
+                list.addView(button("${saved.name}   ·   ${tracksLabel(saved.tracks.size)}   ·   ${saved.bpm} BPM") {
                     scope.launch { openProject(saved.id) }
                 }.apply {
                     gravity = Gravity.START or Gravity.CENTER_VERTICAL
@@ -229,6 +240,170 @@ class MainActivity : Activity() {
         root.addView(ScrollView(this).apply { addView(list) },
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
+    }
+
+    private fun tracksLabel(count: Int) = if (count == 1) "1 track" else "$count tracks"
+
+    private fun prepareClicks() {
+        try {
+            val pool = SoundPool.Builder().setMaxStreams(4).build()
+            clickSound = pool.load(clickFile("minidaw-click.wav", 1200.0, 45), 1)
+            accentSound = pool.load(clickFile("minidaw-accent.wav", 1800.0, 55), 1)
+            soundPool = pool
+        } catch (e: Exception) {
+            Log.w(METER_LOG_TAG, "Metronome click unavailable", e)
+            soundPool = null
+        }
+    }
+
+    // Generates the metronome clicks once into the cache, so no assets are needed in the APK.
+    private fun clickFile(name: String, frequency: Double, millis: Int): String {
+        val file = File(cacheDir, name)
+        if (!file.exists()) {
+            val sampleRate = 44100
+            val frames = sampleRate * millis / 1000
+            val pcm = ByteArray(frames * 2)
+            for (frame in 0 until frames) {
+                val seconds = frame.toDouble() / sampleRate
+                val envelope = exp(-seconds * 90.0)
+                val value = (sin(2 * Math.PI * frequency * seconds) * envelope * 0.45 * Short.MAX_VALUE).toInt()
+                pcm[frame * 2] = (value and 0xff).toByte()
+                pcm[frame * 2 + 1] = ((value shr 8) and 0xff).toByte()
+            }
+            FileOutputStream(file).use { out ->
+                out.write("RIFF".toByteArray())
+                out.write(littleEndianInt(36 + pcm.size))
+                out.write("WAVEfmt ".toByteArray())
+                out.write(littleEndianInt(16))
+                out.write(littleEndianShort(1))
+                out.write(littleEndianShort(1))
+                out.write(littleEndianInt(sampleRate))
+                out.write(littleEndianInt(sampleRate * 2))
+                out.write(littleEndianShort(2))
+                out.write(littleEndianShort(16))
+                out.write("data".toByteArray())
+                out.write(littleEndianInt(pcm.size))
+                out.write(pcm)
+            }
+        }
+        return file.absolutePath
+    }
+
+    private fun littleEndianInt(value: Int) = byteArrayOf(
+        (value and 0xff).toByte(), ((value shr 8) and 0xff).toByte(),
+        ((value shr 16) and 0xff).toByte(), ((value shr 24) and 0xff).toByte())
+
+    private fun littleEndianShort(value: Int) = byteArrayOf(
+        (value and 0xff).toByte(), ((value shr 8) and 0xff).toByte())
+
+    private fun toggleMetronome() {
+        metronomeOn = !metronomeOn
+        prefs.edit().putBoolean("metronome", metronomeOn).apply()
+        status.text = if (metronomeOn) "Metronome on" else "Metronome off"
+    }
+
+    private fun tapTempo() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (tapTimes.isNotEmpty() && now - tapTimes.last() > 3000) tapTimes.clear()
+        tapTimes.addLast(now)
+        while (tapTimes.size > 5) tapTimes.removeFirst()
+        if (tapTimes.size < 2) { status.text = "Tap BPM again"; return }
+        val average = tapTimes.zipWithNext { first, second -> second - first }.average()
+        val bpm = (60000.0 / average).roundToInt().coerceIn(40, 240)
+        val current = project ?: return
+        if (bpm == current.bpm) return
+        current.bpm = bpm
+        bpmLabel.text = "$bpm BPM"
+        refreshClips(); scheduleSave()
+        status.text = "Tempo $bpm BPM"
+    }
+
+    private fun nameInput(initial: String) = EditText(this).apply {
+        setSingleLine()
+        imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE or android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI
+        setText(initial)
+        selectAll()
+        filters = arrayOf(android.text.InputFilter.LengthFilter(80))
+        textSize = 14f
+        setTextColor(Flm.text)
+        setHintTextColor(Flm.textDim)
+        background = GradientDrawable().apply {
+            setColor(Flm.panelAlt)
+            cornerRadius = dp(10).toFloat()
+        }
+        setPadding(dp(12), dp(10), dp(12), dp(10))
+    }
+
+    private fun renameProject() {
+        val current = project ?: return
+        if (loading || stopping) return
+        val input = nameInput(current.name)
+        Sheet(this, "Rename project", "Shown in the projects list").apply {
+            custom(input)
+            primary("SAVE") {
+                val name = input.text.toString().trim()
+                if (name.isEmpty()) { input.error = "Enter a name"; return@primary false }
+                current.name = name
+                if (!saveNow()) { input.error = "Cannot save"; return@primary false }
+                status.text = "$name · autosave"
+                true
+            }
+        }.present()
+        input.requestFocus()
+    }
+
+    private fun renameTrack(index: Int) {
+        val current = project ?: return
+        val track = current.tracks.getOrNull(index) ?: return
+        if (loading || stopping) return
+        val input = nameInput(track.name)
+        Sheet(this, "Rename track", "Track ${index + 1}").apply {
+            custom(input)
+            primary("SAVE") {
+                val name = input.text.toString().trim()
+                if (name.isEmpty()) { input.error = "Enter a name"; return@primary false }
+                track.name = name
+                refreshClips(); renderTracks(); scheduleSave()
+                true
+            }
+        }.present()
+        input.requestFocus()
+    }
+
+    private fun duplicateTrack(index: Int) {
+        val current = project ?: return
+        val source = current.tracks.getOrNull(index) ?: return
+        if (loading || stopping) return
+        if (current.tracks.size >= 16) { status.text = "Maximum 16 tracks"; return }
+        val id = current.id
+        scope.launch {
+            stopTransport()
+            val copy = ProjectTrack(
+                name = "${source.name} copy",
+                pluginId = source.pluginId,
+                audioFile = source.audioFile,
+                audioName = source.audioName,
+                clip = source.clip?.let { clip ->
+                    Clip().also { target -> target.notes.addAll(clip.notes.map { it.copy() }) }
+                },
+                gain = source.gain,
+                muted = source.muted,
+                soloed = source.soloed,
+                drum = source.drum,
+                parameters = HashMap(source.parameters),
+                builtinId = source.builtinId,
+                samples = HashMap(source.samples),
+                sampleNames = HashMap(source.sampleNames)
+            )
+            current.tracks.add(copy)
+            if (copy.clip != null || copy.audioFile != null) {
+                val lane = ((current.arrangement.maxOfOrNull { it.lane } ?: -1) + 1).coerceAtMost(PLAYLIST_LANES - 1)
+                current.arrangement.add(ArrangementClip(trackId = copy.id, lane = lane, startStep = 0))
+            }
+            if (!saveNow()) return@launch
+            openProject(id)
+            status.text = "${source.name} duplicated"
+        }
     }
 
     private fun newProjectDialog() {
@@ -327,31 +502,21 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(Flm.panel)
         }
-        bar.addView(button("PROJECTS") {
-            if (!loading && !stopping) scope.launch {
-                stopTransport()
-                if (!saveNow()) return@launch
-                releaseEngine()
-                project = null
-                showProjects()
-            }
-        }, LinearLayout.LayoutParams(dp(82), dp(34)))
-        bar.addView(button("SAVE") { if (saveNow()) status.text = "Saved · ${project?.name}" },
-            LinearLayout.LayoutParams(dp(50), dp(34)))
-        themeButton = button("THEME") { showThemeDialog() }
-        bar.addView(themeButton, LinearLayout.LayoutParams(dp(56), dp(34)))
-        bar.addView(button("SOUNDS") { showSoundLibrary() }, LinearLayout.LayoutParams(dp(62), dp(34)))
+        metronomeOn = prefs.getBoolean("metronome", false)
+        bar.addView(button("MENU") { showMainMenu() }, LinearLayout.LayoutParams(dp(64), dp(34)))
         transportButton = button("PLAY") { scope.launch { toggleTransport() } }
         recordButton = button("REC") { toggleRecording() }
         bar.addView(transportButton, LinearLayout.LayoutParams(dp(58), dp(34)))
         bar.addView(recordButton, LinearLayout.LayoutParams(dp(46), dp(34)))
         bar.addView(button("−") { changeTempo(-5) }, LinearLayout.LayoutParams(dp(30), dp(34)))
         bpmLabel = label("${project!!.bpm} BPM", 12f)
+        bpmLabel.setOnClickListener { tapTempo() }
         bar.addView(bpmLabel, LinearLayout.LayoutParams(dp(74), dp(34)))
         bar.addView(button("+") { changeTempo(5) }, LinearLayout.LayoutParams(dp(30), dp(34)))
         positionLabel = label("1:01", 12f)
         bar.addView(positionLabel, LinearLayout.LayoutParams(dp(56), dp(34)))
         status = label("${project!!.name} · autosave", 11f)
+        status.setOnClickListener { showMainMenu() }
         bar.addView(status, LinearLayout.LayoutParams(0, dp(34), 1f))
         bar.addView(button("+ TRACK") { insertLane = null; insertStep = 0; showTrackMenu() }, LinearLayout.LayoutParams(dp(74), dp(34)))
         root.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
@@ -401,9 +566,10 @@ class MainActivity : Activity() {
                 }
             }
             onMenu = { showPlaylistClipMenu(it) }
+            onTrackMenu = { lane -> showTrackSheet(lane) }
         }
         arrangementPanel.addView(playlist, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        arrangementPanel.addView(label("Tap empty: insert · Drag clip: move · Double tap: edit · Hold: copy / remove · Swipe empty: scroll", 10f),
+        arrangementPanel.addView(label("Tap empty: insert · Drag clip: move · Double tap: edit · Hold clip: menu · Hold track name: delete track", 10f),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(20)))
         editorPanel.addView(arrangementPanel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         rollPanel = LinearLayout(this).apply {
@@ -666,6 +832,39 @@ class MainActivity : Activity() {
                 }
             }
         }.present()
+    }
+
+    private fun showTrackSheet(index: Int) {
+        if (loading || stopping) return
+        val current = project ?: return
+        val track = current.tracks.getOrNull(index) ?: return
+        Sheet(this, "Track ${index + 1}", track.name).apply {
+            row("Rename track", glyph = "✎", subtitle = "Give it a name you recognise") { renameTrack(index) }
+            row("Duplicate track", glyph = "+", subtitle = "Copy with its instrument and pattern") { duplicateTrack(index) }
+            row("Delete track", glyph = "×", color = Flm.danger,
+                subtitle = "Remove the track with all its clips") {
+                deleteTrack(index)
+            }
+        }.present()
+    }
+
+    private fun deleteTrack(index: Int) {
+        val current = project ?: return
+        val track = current.tracks.getOrNull(index) ?: return
+        val id = current.id
+        if (loading || stopping) return
+        scope.launch {
+            stopTransport()
+            current.tracks.removeAt(index)
+            current.arrangement.removeAll { it.trackId == track.id }
+            if (selected >= current.tracks.size) selected = current.tracks.lastIndex
+            rollOpen = false
+            clearUndo()
+            if (!saveNow()) return@launch
+            // The native graph has no node removal API, so rebuild it from the saved project.
+            openProject(id)
+            status.text = "${track.name} removed"
+        }
     }
 
     private fun showTrackMenu() {
@@ -1167,7 +1366,8 @@ class MainActivity : Activity() {
     }
 
     private fun startTransport() {
-        val p = player ?: return
+        // A metronome-only count-in has nothing to play, so the engine may not exist yet.
+        val p = player ?: if (metronomeOn) ensurePlayer() else return
         if (processing || stopping || loading || !foreground) return
         val current = project ?: return
         val framesPerStep = sampleRate * 60.0 / current.bpm / 4.0
@@ -1208,6 +1408,9 @@ class MainActivity : Activity() {
     }
 
     private fun sequenceStep(step: Long) {
+        if (metronomeOn && step % 4L == 0L) {
+            soundPool?.play(if (step % 16L == 0L) accentSound else clickSound, 0.9f, 0.9f, 1, 0, 1f)
+        }
         pendingOffs.filterValues { it <= step }.keys.toList().forEach { key ->
             sendNote(key.trackId, key.pitch, false)
             pendingOffs.remove(key)
@@ -1470,7 +1673,7 @@ class MainActivity : Activity() {
         }
         mixerScroll.post { mixerScroll.scrollTo(scrollX, 0) }
         updateWorkspaceVisibility()
-        transportButton.isEnabled = player != null && current.tracks.isNotEmpty()
+        transportButton.isEnabled = player != null && (current.tracks.isNotEmpty() || metronomeOn)
         refreshClips()
         updateUndoButton()
     }
@@ -1802,6 +2005,52 @@ class MainActivity : Activity() {
         refreshClips(); updateWorkspaceVisibility(); scheduleSave()
     }
 
+    private fun showMainMenu() {
+        if (loading || stopping) return
+        val current = project ?: return
+        Sheet(this, "Floton", "${current.name} · ${current.bpm} BPM · ${tracksLabel(current.tracks.size)}").apply {
+            row("Project", glyph = "▤", subtitle = "Open, save or rename this session") { showProjectMenu() }
+            row("Sound library", glyph = "≋", color = Flm.success, subtitle = "WAV files, drum kits and samples") {
+                showSoundLibrary()
+            }
+            row("Metronome", glyph = "◉", subtitle = if (metronomeOn) "On · click on every beat" else "Off") {
+                toggleMetronome()
+            }
+            row("Theme", glyph = "◐", subtitle = "Colour scheme of the app") { showThemeDialog() }
+            row("Gesture hints", glyph = "?", color = Flm.info, subtitle = "What every touch gesture does") {
+                showGestureHints()
+            }
+        }.present()
+    }
+
+    private fun showProjectMenu() {
+        if (loading || stopping) return
+        val current = project ?: return
+        Sheet(this, "Project", "${current.name} · ${current.bpm} BPM").apply {
+            row("Projects", glyph = "▤", subtitle = "Save this session and open another one") {
+                if (!loading && !stopping) scope.launch {
+                    stopTransport()
+                    if (!saveNow()) return@launch
+                    releaseEngine()
+                    project = null
+                    showProjects()
+                }
+            }
+            row("Save now", glyph = "✓", subtitle = "Autosave already writes after every edit") {
+                if (saveNow()) status.text = "Saved · ${project?.name}"
+            }
+            row("Rename project", glyph = "✎", subtitle = current.name) { renameProject() }
+        }.present()
+    }
+
+    private fun showGestureHints() {
+        Sheet(this, "Gesture hints", "Tracks, clips and notes").apply {
+            row("Playlist", glyph = "▤", subtitle = "Tap empty: insert · drag clip: move · double tap: edit · hold clip: menu · hold track name: track menu") { }
+            row("Piano roll", glyph = "♫", subtitle = "Tap: add / delete note · drag note: move · right edge: length · empty area ↑↓: scroll") { }
+            row("Transport", glyph = "▶", subtitle = "Tap BPM for tap tempo · MENU holds projects, save, sounds, theme and metronome") { }
+        }.present()
+    }
+
     private fun showThemeDialog() {
         Sheet(this, "Theme", "Palette for panels, lanes and meters").apply {
             Flm.themes.forEachIndexed { index, theme ->
@@ -1848,6 +2097,7 @@ class MainActivity : Activity() {
     private fun startMetering() {
         meterJob?.cancel()
         meterJob = scope.launch {
+            var ticks = 0
             while (isActive && processing) {
                 val p = player ?: break
                 val levels = p.peakLevels
@@ -1859,7 +2109,9 @@ class MainActivity : Activity() {
                         ?: audioIds[track.id]?.let { p.getAudioTrackPeak(it) } ?: 0f
                     view.levels = floatArrayOf(peak, peak)
                 }
-                Log.i(METER_LOG_TAG, "peak ${levels[0]} ${levels[1]}")
+                // Peak levels are sampled every 50 ms; log roughly once a second instead of
+                // flooding logcat with 20 lines per second while the transport runs.
+                if (ticks++ % 20 == 0) Log.i(METER_LOG_TAG, "peak ${levels[0]} ${levels[1]}")
                 delay(50)
             }
         }
@@ -1956,6 +2208,7 @@ class MainActivity : Activity() {
         saveNow()
         scope.cancel()
         releaseEngine()
+        soundPool?.release(); soundPool = null
         client.dispose()
         super.onDestroy()
     }

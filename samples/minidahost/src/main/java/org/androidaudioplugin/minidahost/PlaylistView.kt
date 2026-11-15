@@ -25,6 +25,7 @@ class PlaylistView(context: Context) : View(context) {
     var onSelect: ((ArrangementClip, Boolean) -> Unit)? = null
     var onMove: ((String, Int, Int) -> Unit)? = null
     var onMenu: ((ArrangementClip) -> Unit)? = null
+    var onTrackMenu: ((Int) -> Unit)? = null
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val rect = RectF()
@@ -52,6 +53,10 @@ class PlaylistView(context: Context) : View(context) {
             feedback(false)
             held?.let { onMenu?.invoke(it) }
         }
+    }
+    private var trackLane = -1
+    private val trackLongPress = Runnable {
+        if (mode == 0 && trackLane >= 0) onTrackMenu?.invoke(trackLane)
     }
 
     private fun feedback(active: Boolean) {
@@ -158,10 +163,12 @@ class PlaylistView(context: Context) : View(context) {
             val low = notes.minOfOrNull { it.pitch } ?: 60
             val high = maxOf(low + 12, notes.maxOfOrNull { it.pitch } ?: 72)
             val noteArea = rect.height() - context.dp(18)
+            val thickness = context.dp(3).toFloat()
             notes.forEach { note ->
-                val y = rect.bottom - context.dp(3) - (note.pitch - low).toFloat() / (high - low) * noteArea
-                canvas.drawRect(rect.left + note.step * stepWidth + 1f, y - context.dp(1),
-                    rect.left + (note.step + note.lengthSteps) * stepWidth - 1f, y + 1f, paint)
+                val y = rect.bottom - context.dp(4) - (note.pitch - low).toFloat() / (high - low) * noteArea
+                val left = rect.left + note.step * stepWidth + 1f
+                val right = maxOf(left + context.dp(4), rect.left + (note.step + note.lengthSteps) * stepWidth - 1f)
+                canvas.drawRoundRect(left, y - thickness, right, y + thickness, thickness, thickness, paint)
             }
         } else {
             paint.color = Flm.withAlpha(Flm.text, 160)
@@ -192,10 +199,13 @@ class PlaylistView(context: Context) : View(context) {
                 if (held != null) {
                     feedback(true)
                     postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
+                } else if (event.x < labelWidth && event.y >= rulerHeight) {
+                    trackLane = ((event.y - rulerHeight + offsetY) / laneHeight).toInt().coerceIn(0, PLAYLIST_LANES - 1)
+                    postDelayed(trackLongPress, ViewConfiguration.getLongPressTimeout().toLong())
                 }
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
-                removeCallbacks(longPress)
+                removeCallbacks(longPress); removeCallbacks(trackLongPress); trackLane = -1
                 mode = 3
                 preview = null
                 feedback(false)
@@ -204,7 +214,7 @@ class PlaylistView(context: Context) : View(context) {
                 val dx = event.x - downX
                 val dy = event.y - downY
                 if (mode == 0 && maxOf(abs(dx), abs(dy)) > slop) {
-                    removeCallbacks(longPress)
+                    removeCallbacks(longPress); removeCallbacks(trackLongPress); trackLane = -1
                     mode = if (held != null) { if (canEdit()) 1 else 3 } else 2
                 }
                 if (mode == 1) {
@@ -220,7 +230,7 @@ class PlaylistView(context: Context) : View(context) {
                 }
             }
             MotionEvent.ACTION_UP -> {
-                removeCallbacks(longPress)
+                removeCallbacks(longPress); removeCallbacks(trackLongPress); trackLane = -1
                 val item = held
                 if (mode == 1 && item != null) {
                     val destination = item.copy(
@@ -243,7 +253,7 @@ class PlaylistView(context: Context) : View(context) {
                 parent.requestDisallowInterceptTouchEvent(false)
             }
             MotionEvent.ACTION_CANCEL -> {
-                removeCallbacks(longPress)
+                removeCallbacks(longPress); removeCallbacks(trackLongPress); trackLane = -1
                 preview = null; held = null; mode = 3
                 feedback(false)
                 parent.requestDisallowInterceptTouchEvent(false)
@@ -253,7 +263,7 @@ class PlaylistView(context: Context) : View(context) {
     }
 
     override fun onDetachedFromWindow() {
-        removeCallbacks(longPress)
+        removeCallbacks(longPress); removeCallbacks(trackLongPress)
         animator?.cancel()
         super.onDetachedFromWindow()
     }
