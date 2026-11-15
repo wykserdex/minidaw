@@ -1,4 +1,6 @@
 #include <jni.h>
+#include <algorithm>
+#include <cmath>
 
 #include "PluginPlayer.h"
 
@@ -183,6 +185,48 @@ Java_org_androidaudioplugin_manager_PluginPlayer_loadAudioTrackNative(JNIEnv* en
 }
 
 extern "C"
+JNIEXPORT jboolean JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_setAudioTrackPlacementsNative(JNIEnv* env, jobject,
+                                                                              jlong player, jint trackId,
+                                                                              jlongArray starts) {
+    if (!player || trackId < 0 || !starts || env->ExceptionCheck())
+        return JNI_FALSE;
+    const auto length = env->GetArrayLength(starts);
+    if (env->ExceptionCheck() || length < 0 ||
+        static_cast<size_t>(length) > aap::AudioTrackNode::max_placements)
+        return JNI_FALSE;
+    std::array<jlong, aap::AudioTrackNode::max_placements> values{};
+    if (length > 0)
+        env->GetLongArrayRegion(starts, 0, length, values.data());
+    if (env->ExceptionCheck())
+        return JNI_FALSE;
+    for (jsize i = 0; i < length; ++i)
+        if (values[i] < 0 || static_cast<uint64_t>(values[i]) > aap::AudioTrackNode::max_placement_start)
+            return JNI_FALSE;
+    try {
+        // Only the control caller allocates; the callback reads the published schedule.
+        std::vector<uint64_t> placements(values.begin(), values.begin() + length);
+        return ((aap::PluginPlayer*) player)->getGraph().setAudioTrackPlacements(trackId, placements)
+               ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
+
+extern "C"
+JNIEXPORT jlong JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_getAudioTrackDurationFramesNative(JNIEnv *, jobject,
+                                                                                  jlong player, jint trackId) {
+    if (!player || trackId < 0)
+        return 0;
+    try {
+        return static_cast<jlong>(((aap::PluginPlayer*) player)->getGraph().getAudioTrackDurationFrames(trackId));
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C"
 JNIEXPORT void JNICALL
 Java_org_androidaudioplugin_manager_PluginPlayer_setAudioTrackGainNative(JNIEnv *, jobject,
                                                                        jlong player, jint trackId,
@@ -196,6 +240,87 @@ JNIEXPORT jfloat JNICALL
 Java_org_androidaudioplugin_manager_PluginPlayer_getAudioTrackPeakNative(JNIEnv *, jobject,
                                                                        jlong player, jint trackId) {
     return player ? ((aap::PluginPlayer*) player)->getGraph().getAudioTrackPeak(trackId) : 0.0f;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_addBuiltinInstrumentNative(JNIEnv *, jobject,
+                                                                           jlong player, jint kind) {
+    if (!player || kind < 0 || kind > 2)
+        return -1;
+    try {
+        return ((aap::PluginPlayer*) player)->getGraph().addBuiltinInstrument(kind);
+    } catch (...) {
+        return -1;
+    }
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_builtinNoteNative(JNIEnv *, jobject,
+                                                                   jlong player, jint id, jint pitch,
+                                                                   jfloat velocity, jboolean down) {
+    if (!player || id < 0 || pitch < 0 || pitch > 127 || !std::isfinite(velocity))
+        return;
+    try {
+        ((aap::PluginPlayer*) player)->getGraph().builtinNote(
+                id, pitch, std::clamp(velocity, 0.0f, 1.0f), down == JNI_TRUE);
+    } catch (...) {
+    }
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_loadBuiltinSampleNative(JNIEnv* env, jobject,
+                                                                         jlong player, jint id, jint pitch,
+                                                                         jbyteArray bytes, jstring filename) {
+    if (!player || id < 0 || pitch < 0 || pitch > 127 || !bytes || !filename)
+        return JNI_FALSE;
+    auto length = env->GetArrayLength(bytes);
+    if (length <= 0 || length > 64 * 1024 * 1024)
+        return JNI_FALSE;
+    auto data = env->GetByteArrayElements(bytes, nullptr);
+    if (!data)
+        return JNI_FALSE;
+    auto name = env->GetStringUTFChars(filename, nullptr);
+    if (!name) {
+        env->ReleaseByteArrayElements(bytes, data, JNI_ABORT);
+        return JNI_FALSE;
+    }
+    bool loaded = false;
+    try {
+        loaded = ((aap::PluginPlayer*) player)->getGraph().loadBuiltinSample(
+                id, pitch, (uint8_t*) data, length, name);
+    } catch (...) {
+    }
+    env->ReleaseStringUTFChars(filename, name);
+    env->ReleaseByteArrayElements(bytes, data, JNI_ABORT);
+    return loaded ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_setBuiltinGainNative(JNIEnv *, jobject,
+                                                                      jlong player, jint id, jfloat gain) {
+    if (!player || id < 0)
+        return;
+    try {
+        ((aap::PluginPlayer*) player)->getGraph().setBuiltinGain(id, gain);
+    } catch (...) {
+    }
+}
+
+extern "C"
+JNIEXPORT jfloat JNICALL
+Java_org_androidaudioplugin_manager_PluginPlayer_getBuiltinPeakNative(JNIEnv *, jobject,
+                                                                      jlong player, jint id) {
+    if (!player || id < 0)
+        return 0.0f;
+    try {
+        return ((aap::PluginPlayer*) player)->getGraph().getBuiltinPeak(id);
+    } catch (...) {
+        return 0.0f;
+    }
 }
 
 extern "C"

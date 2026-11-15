@@ -64,6 +64,18 @@ class PluginPlayer private constructor(private val native: Long) : AutoCloseable
 
     private external fun loadAudioTrackNative(player: Long, trackId: Int, bytes: ByteArray, filename: String): Boolean
 
+    // Absolute transport-frame starts (0..2^53), up to 256. Empty means silent; default is [0].
+    // Replacement preserves the running transport position; failure keeps the old schedule.
+    fun setAudioTrackPlacements(trackId: Int, starts: LongArray): Boolean =
+        setAudioTrackPlacementsNative(native, trackId, starts)
+
+    private external fun setAudioTrackPlacementsNative(player: Long, trackId: Int, starts: LongArray): Boolean
+
+    // Full decoded duration at the graph sample rate; zero for an invalid or unloaded track.
+    fun getAudioTrackDurationFrames(trackId: Int): Long = getAudioTrackDurationFramesNative(native, trackId)
+
+    private external fun getAudioTrackDurationFramesNative(player: Long, trackId: Int): Long
+
     fun setAudioTrackGain(trackId: Int, gain: Float) = setAudioTrackGainNative(native, trackId, gain)
 
     private external fun setAudioTrackGainNative(player: Long, trackId: Int, gain: Float)
@@ -72,6 +84,28 @@ class PluginPlayer private constructor(private val native: Long) : AutoCloseable
     fun getAudioTrackPeak(trackId: Int): Float = getAudioTrackPeakNative(native, trackId)
 
     private external fun getAudioTrackPeakNative(player: Long, trackId: Int): Float
+
+    fun addBuiltinInstrument(kind: Int): Int = addBuiltinInstrumentNative(native, kind)
+
+    private external fun addBuiltinInstrumentNative(player: Long, kind: Int): Int
+
+    fun builtinNote(id: Int, pitch: Int, velocity: Float, down: Boolean) =
+        builtinNoteNative(native, id, pitch, velocity, down)
+
+    private external fun builtinNoteNative(player: Long, id: Int, pitch: Int, velocity: Float, down: Boolean)
+
+    fun loadBuiltinSample(id: Int, pitch: Int, bytes: ByteArray, filename: String): Boolean =
+        loadBuiltinSampleNative(native, id, pitch, bytes, filename)
+
+    private external fun loadBuiltinSampleNative(player: Long, id: Int, pitch: Int, bytes: ByteArray, filename: String): Boolean
+
+    fun setBuiltinGain(id: Int, gain: Float) = setBuiltinGainNative(native, id, gain)
+
+    private external fun setBuiltinGainNative(player: Long, id: Int, gain: Float)
+
+    fun getBuiltinPeak(id: Int): Float = getBuiltinPeakNative(native, id)
+
+    private external fun getBuiltinPeakNative(player: Long, id: Int): Float
 
     // Feeds only the UMP groups set in the mask to the plugin node that hosts it.
     // 0xFFFF is the broadcast, 0 mutes the node's MIDI input.

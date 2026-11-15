@@ -168,7 +168,7 @@ namespace {
 
     std::unique_ptr<DecodedClip> decodeAudio(uint8_t* data, int dataLength,
                                            const char* filename, int32_t sampleRate,
-                                           uint64_t byteBudget) {
+                                           uint64_t byteBudget, long double maxDuration = 120.0L) {
         if (!data || dataLength <= 0 || static_cast<uint64_t>(dataLength) > maxDecodedBytes ||
             !filename || !*filename || sampleRate <= 0 || sampleRate > 768000 || byteBudget == 0)
             return nullptr;
@@ -198,7 +198,7 @@ namespace {
                     props.sampleRate > 768000)
                     return nullptr;
                 auto duration = static_cast<long double>(props.numFrames) / props.sampleRate;
-                if (!std::isfinite(duration) || duration <= 0 || duration > 120.0L)
+                if (!std::isfinite(duration) || duration <= 0 || duration > maxDuration)
                     return nullptr;
                 auto resampledFrames = props.sampleRate == sampleRate ?
                                        static_cast<long double>(props.numFrames) :
@@ -296,7 +296,7 @@ bool aap::AudioDataSourceNode::setAudioSource(uint8_t* data, int dataLength, con
 aap::AudioDataSourceNode::~AudioDataSourceNode() = default;
 
 void aap::AudioTrackNode::start() {
-    current_frame_offset = 0;
+    timeline_frame = 0;
     active = true;
     last_block_peak.store(0.0f, std::memory_order_relaxed);
 }
@@ -321,35 +321,429 @@ bool aap::AudioTrackNode::load(uint8_t* bytes, int dataLength, const char* filen
     if (!replacement)
         return false;
     clip = std::move(replacement);
-    current_frame_offset = 0;
+    if (!active)
+        timeline_frame = 0;
     last_block_peak.store(0.0f, std::memory_order_relaxed);
     return true;
 }
 
+uint64_t aap::AudioTrackNode::getDurationFrames() const {
+    return clip ? clip->getNumFrames() : 0;
+}
+
+bool aap::AudioTrackNode::setPlacements(const std::vector<uint64_t>& starts) {
+    if (starts.size() > max_placements)
+        return false;
+    for (auto start : starts)
+        if (start > max_placement_start ||
+            getDurationFrames() > std::numeric_limits<uint64_t>::max() - start)
+            return false;
+    try {
+        auto replacement = starts;
+        placements.swap(replacement);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 void aap::AudioTrackNode::processAudio(AudioBuffer* audioData, int32_t numFrames) {
     float peak = 0.0f;
-    if (active && clip && current_frame_offset < clip->getNumFrames() && numFrames > 0) {
-        auto frames = std::min(clip->getNumFrames() - current_frame_offset,
-                               std::min(static_cast<uint32_t>(numFrames), audioData->audio.getNumFrames()));
+    if (active && numFrames > 0) {
+        // Saturate rather than wrap even after an exceptionally long transport run.
+        const auto advance = std::min<uint64_t>(numFrames,
+                std::numeric_limits<uint64_t>::max() - timeline_frame);
+        const auto end = timeline_frame + std::min<uint64_t>(advance, audioData->audio.getNumFrames());
         const auto gain = audio_gain.load(std::memory_order_relaxed);
-        auto channels = audioData->audio.getNumChannels();
-        auto sourceChannels = clip->getNumChannels();
-        // Mono is duplicated; stereo is averaged for a mono bus, or uses left/right only.
-        auto mappedChannels = sourceChannels == 1 ? channels : std::min(channels, sourceChannels);
-        for (uint32_t ch = 0; ch < mappedChannels; ++ch) {
-            auto dst = audioData->audio.getChannel(ch).data.data;
-            auto src = clip->getChannel(sourceChannels == 1 ? 0 : ch).data.data + current_frame_offset;
-            auto right = sourceChannels == 2 && channels == 1 ?
-                         clip->getChannel(1).data.data + current_frame_offset : nullptr;
-            for (uint32_t frame = 0; frame < frames; ++frame) {
-                const auto sample = gain == 0.0f ? 0.0f :
-                                    (right ? src[frame] * 0.5f + right[frame] * 0.5f : src[frame]) * gain;
-                dst[frame] += sample;
-                peak = std::max(peak, std::fabs(sample));
+        if (clip && gain != 0.0f) {
+            auto channels = audioData->audio.getNumChannels();
+            auto sourceChannels = clip->getNumChannels();
+            // Mono is duplicated; stereo is averaged for a mono bus, or uses left/right only.
+            auto mappedChannels = sourceChannels == 1 ? channels : std::min(channels, sourceChannels);
+            for (auto start : placements) {
+                // Starts are bounded to 2^53 and decoded lengths to int32_t, so this cannot wrap.
+                auto clipEnd = start + getDurationFrames();
+                auto begin = std::max(timeline_frame, start);
+                auto overlapEnd = std::min(end, clipEnd);
+                if (begin >= overlapEnd)
+                    continue;
+                auto sourceOffset = static_cast<uint32_t>(begin - start);
+                auto destinationOffset = static_cast<uint32_t>(begin - timeline_frame);
+                auto frames = static_cast<uint32_t>(overlapEnd - begin);
+                for (uint32_t ch = 0; ch < mappedChannels; ++ch) {
+                    auto dst = audioData->audio.getChannel(ch).data.data + destinationOffset;
+                    auto src = clip->getChannel(sourceChannels == 1 ? 0 : ch).data.data + sourceOffset;
+                    auto right = sourceChannels == 2 && channels == 1 ?
+                                 clip->getChannel(1).data.data + sourceOffset : nullptr;
+                    for (uint32_t frame = 0; frame < frames; ++frame) {
+                        const auto sample = (right ? src[frame] * 0.5f + right[frame] * 0.5f : src[frame]) * gain;
+                        dst[frame] += sample;
+                        peak = std::max(peak, std::fabs(sample));
+                    }
+                }
             }
         }
-        // Muted tracks advance too. At EOF they remain silent until the next start.
-        current_frame_offset += frames;
+        // Advance through gaps, empty schedules, EOF and mute without restarting instances.
+        timeline_frame += advance;
+    }
+    last_block_peak.store(peak, std::memory_order_relaxed);
+}
+
+namespace {
+    constexpr float twoPi = 6.2831853071795864769f;
+
+    float polyBlep(float phase, float increment) {
+        if (phase < increment) {
+            auto t = phase / increment;
+            return t + t - t * t - 1.0f;
+        }
+        if (phase > 1.0f - increment) {
+            auto t = (phase - 1.0f) / increment;
+            return t * t + t + t + 1.0f;
+        }
+        return 0.0f;
+    }
+
+    float analogOscillator(float phase, float increment) {
+        auto saw = phase * 2.0f - 1.0f - polyBlep(phase, increment);
+        auto shifted = phase + 0.5f;
+        if (shifted >= 1.0f)
+            shifted -= 1.0f;
+        auto pulse = (phase < 0.5f ? 1.0f : -1.0f) + polyBlep(phase, increment) -
+                     polyBlep(shifted, increment);
+        return 0.6f * saw + 0.15f * pulse - 0.25f * std::sin(twoPi * phase);
+    }
+
+    float drumDuration(int pitch) {
+        switch (pitch) {
+            case 36: return 0.65f;
+            case 38: return 0.30f;
+            case 39: return 0.28f;
+            case 42: return 0.12f;
+            case 46: return 0.70f;
+            case 45: return 0.55f;
+            case 49: return 1.80f;
+            case 51: return 1.25f;
+            default: return 0.0f;
+        }
+    }
+}
+
+aap::BuiltinInstrumentNode::BuiltinInstrumentNode(AudioGraph* ownerGraph, int instrumentKind) :
+        AudioGraphNode(ownerGraph), kind(instrumentKind),
+        fade_frames(std::max(1L, std::lround(std::max(1, ownerGraph->getSampleRate()) * 0.005))),
+        sample_rate(static_cast<float>(std::max(1, ownerGraph->getSampleRate()))),
+        attack_step(1.0f / (sample_rate * (kind == 0 ? 0.006f : 0.012f))),
+        decay_step((1.0f - (kind == 0 ? 0.70f : 0.55f)) /
+                   (sample_rate * (kind == 0 ? 0.13f : 0.25f))),
+        sustain_level(kind == 0 ? 0.70f : 0.55f),
+        release_frames(std::max(1.0f, sample_rate * (kind == 0 ? 0.16f : 0.35f))) {
+    static_assert(std::atomic<uint32_t>::is_always_lock_free &&
+                  std::atomic<bool>::is_always_lock_free && std::atomic<float>::is_always_lock_free,
+                  "Built-in instruments require lock-free callback atomics");
+}
+
+void aap::BuiltinInstrumentNode::reset() {
+    // ControlScope quiesces both the producer and consumer before resetting the ring.
+    event_read.store(0, std::memory_order_relaxed);
+    event_write.store(0, std::memory_order_relaxed);
+    event_overflow.store(false, std::memory_order_relaxed);
+    voices = {};
+    next_serial = 0;
+    last_block_peak.store(0.0f, std::memory_order_relaxed);
+}
+
+void aap::BuiltinInstrumentNode::start() {
+    reset();
+    active = true;
+}
+
+void aap::BuiltinInstrumentNode::pause() {
+    active = false;
+    reset();
+}
+
+void aap::BuiltinInstrumentNode::setGain(float gain) {
+    audio_gain.store(std::isfinite(gain) ? std::clamp(gain, 0.0f, 4.0f) : 0.0f,
+                     std::memory_order_relaxed);
+}
+
+void aap::BuiltinInstrumentNode::note(int pitch, float velocity, bool down) {
+    if (!active || pitch < 0 || pitch > 127 || !std::isfinite(velocity))
+        return;
+    auto write = event_write.load(std::memory_order_relaxed);
+    if (write - event_read.load(std::memory_order_acquire) >= event_capacity) {
+        event_overflow.store(true, std::memory_order_release);
+        return;
+    }
+    events[write % event_capacity] = {pitch, std::clamp(velocity, 0.0f, 1.0f), down && velocity > 0};
+    event_write.store(write + 1, std::memory_order_release);
+}
+
+void aap::BuiltinInstrumentNode::releaseVoice(Voice& voice) {
+    if (voice.stage != Off && voice.stage != Release && voice.stage != Drum) {
+        voice.release_step = voice.envelope / release_frames;
+        voice.stage = Release;
+    }
+}
+
+void aap::BuiltinInstrumentNode::retireVoice(Voice& voice) {
+    voice.tail_left = voice.last_left;
+    voice.tail_right = voice.last_right;
+    voice.tail_frames = fade_frames;
+    voice.stage = Off;
+}
+
+void aap::BuiltinInstrumentNode::handleNote(const NoteEvent& event) {
+    if (!event.down) {
+        if (kind != 2)
+            for (auto& voice : voices)
+                if (voice.pitch == event.pitch)
+                    releaseVoice(voice);
+        return;
+    }
+    if (kind == 2 && !samples[event.pitch] && drumDuration(event.pitch) == 0.0f)
+        return;
+    if (kind == 2 && event.pitch == 42)
+        for (auto& voice : voices)
+            if (voice.pitch == 46 && voice.stage == Drum)
+                retireVoice(voice);
+
+    Voice* selected = nullptr;
+    if (kind != 2)
+        for (auto& voice : voices)
+            if (voice.pitch == event.pitch && voice.stage != Off) {
+                selected = &voice;
+                break;
+            }
+    if (!selected)
+        for (auto& voice : voices)
+            if (voice.stage == Off && voice.tail_frames == 0) {
+                selected = &voice;
+                break;
+            }
+    if (!selected) {
+        selected = &voices[0];
+        for (auto& voice : voices) {
+            auto releasing = voice.stage == Release || voice.stage == Off;
+            auto selectedReleasing = selected->stage == Release || selected->stage == Off;
+            if ((releasing && !selectedReleasing) ||
+                (releasing && selectedReleasing && voice.envelope < selected->envelope) ||
+                (releasing == selectedReleasing && voice.serial < selected->serial))
+                selected = &voice;
+        }
+    }
+    auto oldLeft = selected->last_left;
+    auto oldRight = selected->last_right;
+    *selected = {};
+    selected->tail_left = oldLeft;
+    selected->tail_right = oldRight;
+    selected->tail_frames = fade_frames;
+    selected->stage = kind == 2 ? Drum : Attack;
+    selected->pitch = event.pitch;
+    selected->velocity = event.velocity;
+    selected->serial = ++next_serial;
+    selected->random = 0x9E3779B9u ^ (static_cast<uint32_t>(next_serial) * 747796405u);
+    if (selected->random == 0)
+        selected->random = 1;
+    auto frequency = 440.0f * std::exp2((event.pitch - 69) / 12.0f);
+    selected->increment = std::min(0.45f, frequency / sample_rate);
+}
+
+uint64_t aap::BuiltinInstrumentNode::getDecodedBytes(int pitch) const {
+    if (pitch < 0 || pitch > 127 || !samples[pitch])
+        return 0;
+    return clipBytes(samples[pitch]->getNumChannels(), samples[pitch]->getNumFrames());
+}
+
+bool aap::BuiltinInstrumentNode::loadSample(int pitch, uint8_t* bytes, int dataLength,
+                                           const char* filename, uint64_t byteBudget) {
+    if (kind != 2 || pitch < 0 || pitch > 127)
+        return false;
+    auto replacement = decodeAudio(bytes, dataLength, filename, graph->getSampleRate(), byteBudget, 20.0L);
+    if (!replacement)
+        return false;
+    for (auto& voice : voices)
+        if (voice.pitch == pitch && voice.stage == Drum)
+            retireVoice(voice);
+    samples[pitch] = std::move(replacement);
+    last_block_peak.store(0.0f, std::memory_order_relaxed);
+    return true;
+}
+
+void aap::BuiltinInstrumentNode::renderVoice(Voice& voice, float& left, float& right) {
+    left = right = 0.0f;
+    if (voice.stage == Drum) {
+        const auto* clip = samples[voice.pitch].get();
+        if (clip) {
+            auto frames = clip->getNumFrames();
+            if (voice.frame < frames) {
+                auto fade = std::min(fade_frames, std::max(1u, frames / 2));
+                auto envelope = std::min(1.0f, static_cast<float>(voice.frame + 1) / fade) *
+                                std::min(1.0f, static_cast<float>(frames - voice.frame) / fade);
+                auto scale = voice.velocity * envelope * 0.5f;
+                left = std::clamp(clip->getChannel(0).data.data[voice.frame], -4.0f, 4.0f) * scale;
+                right = clip->getNumChannels() == 1 ? left :
+                        std::clamp(clip->getChannel(1).data.data[voice.frame], -4.0f, 4.0f) * scale;
+                ++voice.frame;
+            } else {
+                voice.stage = Off;
+            }
+        } else {
+            auto t = static_cast<float>(voice.frame) / sample_rate;
+            auto duration = drumDuration(voice.pitch);
+            if (t >= duration) {
+                voice.stage = Off;
+            } else {
+                voice.random ^= voice.random << 13;
+                voice.random ^= voice.random >> 17;
+                voice.random ^= voice.random << 5;
+                auto noise = static_cast<float>(voice.random >> 8) / 8388607.5f - 1.0f;
+                auto highNoise = (noise - voice.noise_previous) * 0.5f;
+                voice.noise_previous = noise;
+                float signal = 0.0f;
+                switch (voice.pitch) {
+                    case 36: {
+                        auto frequency = 45.0f + 120.0f * std::exp(-t * 40.0f);
+                        voice.phase += std::min(0.45f, frequency / sample_rate);
+                        voice.phase -= std::floor(voice.phase);
+                        signal = std::sin(twoPi * voice.phase) * std::exp(-t * 8.0f) +
+                                 noise * 0.12f * std::exp(-t * 160.0f);
+                        break;
+                    }
+                    case 38:
+                        signal = highNoise * 0.85f * std::exp(-t * 16.0f) +
+                                 std::sin(twoPi * t * 185.0f) * 0.25f * std::exp(-t * 24.0f);
+                        break;
+                    case 39: {
+                        float bursts = 0.0f;
+                        for (int burst = 0; burst < 3; ++burst) {
+                            auto age = t - burst * 0.012f;
+                            if (age >= 0.0f)
+                                bursts += std::min(1.0f, age * 1500.0f) * std::exp(-age * 100.0f);
+                        }
+                        signal = highNoise * (bursts + 0.3f * std::exp(-t * 20.0f));
+                        break;
+                    }
+                    case 45: {
+                        auto frequency = 100.0f + 75.0f * std::exp(-t * 22.0f);
+                        voice.phase += std::min(0.45f, frequency / sample_rate);
+                        voice.phase -= std::floor(voice.phase);
+                        signal = std::sin(twoPi * voice.phase) * std::exp(-t * 9.0f) +
+                                 noise * 0.06f * std::exp(-t * 45.0f);
+                        break;
+                    }
+                    default: {
+                        float metal = 0.0f;
+                        const float partials[]{2341.0f, 3457.0f, 5311.0f, 7897.0f};
+                        for (auto frequency : partials)
+                            if (frequency < sample_rate * 0.45f)
+                                metal += std::sin(twoPi * t * frequency) * 0.25f;
+                        auto decay = voice.pitch == 42 ? 42.0f : voice.pitch == 46 ? 8.0f :
+                                     voice.pitch == 49 ? 3.5f : 5.0f;
+                        signal = (voice.pitch == 51 ? metal * 0.8f + highNoise * 0.2f :
+                                  metal * 0.25f + highNoise * 0.75f) * std::exp(-t * decay);
+                        break;
+                    }
+                }
+                auto envelope = std::min(1.0f, t * 1000.0f) *
+                                std::min(1.0f, std::max(0.0f, duration - t) / 0.008f);
+                left = right = signal * envelope * voice.velocity * (voice.pitch == 36 ? 0.6f : 0.45f);
+                ++voice.frame;
+            }
+        }
+    } else if (voice.stage != Off) {
+        switch (voice.stage) {
+            case Attack:
+                voice.envelope = std::min(1.0f, voice.envelope + attack_step);
+                if (voice.envelope >= 1.0f)
+                    voice.stage = Decay;
+                break;
+            case Decay:
+                voice.envelope = std::max(sustain_level, voice.envelope - decay_step);
+                if (voice.envelope <= sustain_level)
+                    voice.stage = Sustain;
+                break;
+            case Release:
+                voice.envelope = std::max(0.0f, voice.envelope - voice.release_step);
+                if (voice.envelope <= 0.0f)
+                    voice.stage = Off;
+                break;
+            default: break;
+        }
+        float oscillator;
+        if (kind == 0) {
+            oscillator = std::sin(twoPi * voice.phase) * 0.78f;
+            if (voice.increment < 0.225f)
+                oscillator += std::sin(twoPi * voice.phase * 2.0f) * 0.16f;
+            if (voice.increment < 0.15f)
+                oscillator += std::sin(twoPi * voice.phase * 3.0f) * 0.06f;
+        } else {
+            oscillator = (analogOscillator(voice.phase, voice.increment) +
+                          analogOscillator(voice.phase2, voice.increment * 1.0043f)) * 0.5f;
+        }
+        auto cutoff = std::min(0.35f, voice.increment * (kind == 0 ? 4.0f : 2.0f + voice.envelope * 8.0f));
+        auto coefficient = twoPi * cutoff / (1.0f + twoPi * cutoff);
+        voice.filter += coefficient * (oscillator - voice.filter);
+        if (std::fabs(voice.filter) < 1.0e-20f)
+            voice.filter = 0.0f;
+        left = right = voice.filter * voice.envelope * voice.velocity * (kind == 0 ? 0.28f : 0.16f);
+        voice.phase += voice.increment;
+        voice.phase -= std::floor(voice.phase);
+        voice.phase2 += voice.increment * 1.0043f;
+        voice.phase2 -= std::floor(voice.phase2);
+    }
+    if (voice.tail_frames > 0) {
+        auto fade = static_cast<float>(voice.tail_frames) / fade_frames;
+        left += voice.tail_left * fade;
+        right += voice.tail_right * fade;
+        --voice.tail_frames;
+    }
+    voice.last_left = left;
+    voice.last_right = right;
+}
+
+void aap::BuiltinInstrumentNode::processAudio(AudioBuffer* audioData, int32_t numFrames) {
+    if (!active) {
+        last_block_peak.store(0.0f, std::memory_order_relaxed);
+        return;
+    }
+    auto read = event_read.load(std::memory_order_relaxed);
+    auto overflow = event_overflow.exchange(false, std::memory_order_acq_rel);
+    auto write = event_write.load(std::memory_order_acquire);
+    if (overflow) {
+        for (auto& voice : voices)
+            releaseVoice(voice);
+        read = write;
+    }
+    while (read != write) {
+        handleNote(events[read % event_capacity]);
+        ++read;
+    }
+    event_read.store(read, std::memory_order_release);
+
+    auto frames = std::min(static_cast<uint32_t>(std::max(0, numFrames)), audioData->audio.getNumFrames());
+    auto channels = audioData->audio.getNumChannels();
+    auto gain = audio_gain.load(std::memory_order_relaxed);
+    float peak = 0.0f;
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+        float left = 0.0f, right = 0.0f;
+        for (auto& voice : voices) {
+            if (voice.stage == Off && voice.tail_frames == 0)
+                continue;
+            float voiceLeft, voiceRight;
+            renderVoice(voice, voiceLeft, voiceRight);
+            left += voiceLeft;
+            right += voiceRight;
+        }
+        left = 0.8f * std::tanh(left) * gain;
+        right = 0.8f * std::tanh(right) * gain;
+        for (uint32_t channel = 0; channel < channels; ++channel) {
+            auto sample = channels == 1 || channel > 1 ? left * 0.5f + right * 0.5f :
+                          channel == 0 ? left : right;
+            audioData->audio.getChannel(channel).data.data[frame] += sample;
+            peak = std::max(peak, std::fabs(sample));
+        }
     }
     last_block_peak.store(peak, std::memory_order_relaxed);
 }

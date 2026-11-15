@@ -3,7 +3,6 @@ package org.androidaudioplugin.minidahost
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.view.MotionEvent
@@ -26,6 +25,11 @@ class KnobView(context: Context) : View(context) {
             field = value.coerceIn(0f, 1f)
             invalidate()
         }
+    var accentColor = Flm.accent
+        set(value) {
+            field = value
+            invalidate()
+        }
     var onFraction: ((Float) -> Unit)? = null
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -46,9 +50,9 @@ class KnobView(context: Context) : View(context) {
 
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = size * 0.055f
-        paint.color = Color.rgb(0x3C, 0x40, 0x4A)
+        paint.color = Flm.withAlpha(Flm.text, 70)
         canvas.drawArc(arc, 135f, 270f, false, paint)
-        paint.color = Flm.accent
+        paint.color = accentColor
         canvas.drawArc(arc, 135f, 270f * fraction, false, paint)
 
         // The arc leaves the paint in STROKE mode; text drawn with a fat stroke is illegible.

@@ -122,6 +122,8 @@ void aap::SimpleLinearAudioGraph::rebuild_nodes() {
         nodes.emplace_back(node.get());
     for (auto &node : sum_nodes)
         nodes.emplace_back(node.get());
+    for (auto &node : builtin_instruments)
+        nodes.emplace_back(node.get());
     for (auto &node : chain_nodes)
         nodes.emplace_back(node.get());
     nodes.emplace_back(&midi_output);
@@ -214,10 +216,27 @@ bool aap::SimpleLinearAudioGraph::loadAudioTrack(int trackId, uint8_t* bytes, in
         return false;
     const auto previousBytes = track->getDecodedBytes();
     // Count the old clip as well until a replacement has decoded successfully.
-    if (!track->load(bytes, dataLength, filename, max_audio_track_bytes - decoded_audio_track_bytes))
+    if (!track->load(bytes, dataLength, filename, max_decoded_audio_bytes - decoded_audio_bytes))
         return false;
-    decoded_audio_track_bytes = decoded_audio_track_bytes - previousBytes + track->getDecodedBytes();
+    decoded_audio_bytes = decoded_audio_bytes - previousBytes + track->getDecodedBytes();
     return true;
+}
+
+bool aap::SimpleLinearAudioGraph::setAudioTrackPlacements(int trackId,
+                                                         const std::vector<uint64_t>& starts) {
+    try {
+        ControlScope control{*this};
+        auto track = find_audio_track(trackId);
+        return track && track->setPlacements(starts);
+    } catch (...) {
+        return false;
+    }
+}
+
+uint64_t aap::SimpleLinearAudioGraph::getAudioTrackDurationFrames(int trackId) {
+    const std::lock_guard<std::mutex> lock{control_mutex};
+    auto track = find_audio_track(trackId);
+    return track ? track->getDurationFrames() : 0;
 }
 
 void aap::SimpleLinearAudioGraph::setAudioTrackGain(int trackId, float gain) {
@@ -230,6 +249,69 @@ float aap::SimpleLinearAudioGraph::getAudioTrackPeak(int trackId) {
     const std::lock_guard<std::mutex> lock{control_mutex};
     auto track = find_audio_track(trackId);
     return track ? track->getPeak() : 0.0f;
+}
+
+int aap::SimpleLinearAudioGraph::addBuiltinInstrument(int kind) {
+    if (kind < 0 || kind > 2)
+        return -1;
+    ControlScope control{*this};
+    if (builtin_instruments.size() >= static_cast<size_t>(std::numeric_limits<int>::max()))
+        return -1;
+    try {
+        auto node = std::make_unique<BuiltinInstrumentNode>(this, kind);
+        nodes.reserve(nodes.size() + 1);
+        builtin_instruments.reserve(builtin_instruments.size() + 1);
+        if (isProcessing())
+            node->start();
+        auto id = static_cast<int>(builtin_instruments.size());
+        builtin_instruments.push_back(std::move(node));
+        rebuild_nodes();
+        return id;
+    } catch (...) {
+        return -1;
+    }
+}
+
+aap::BuiltinInstrumentNode* aap::SimpleLinearAudioGraph::find_builtin_instrument(int id) {
+    return id >= 0 && static_cast<size_t>(id) < builtin_instruments.size() ?
+           builtin_instruments[id].get() : nullptr;
+}
+
+void aap::SimpleLinearAudioGraph::builtinNote(int id, int pitch, float velocity, bool down) {
+    if (pitch < 0 || pitch > 127 || !std::isfinite(velocity))
+        return;
+    const std::lock_guard<std::mutex> lock{control_mutex};
+    if (!isProcessing())
+        return;
+    if (auto node = find_builtin_instrument(id))
+        node->note(pitch, std::clamp(velocity, 0.0f, 1.0f), down);
+}
+
+bool aap::SimpleLinearAudioGraph::loadBuiltinSample(int id, int pitch, uint8_t* bytes,
+                                                  int dataLength, const char* filename) {
+    if (pitch < 0 || pitch > 127)
+        return false;
+    ControlScope control{*this};
+    auto node = find_builtin_instrument(id);
+    if (!node)
+        return false;
+    const auto previousBytes = node->getDecodedBytes(pitch);
+    if (!node->loadSample(pitch, bytes, dataLength, filename, max_decoded_audio_bytes - decoded_audio_bytes))
+        return false;
+    decoded_audio_bytes = decoded_audio_bytes - previousBytes + node->getDecodedBytes(pitch);
+    return true;
+}
+
+void aap::SimpleLinearAudioGraph::setBuiltinGain(int id, float gain) {
+    const std::lock_guard<std::mutex> lock{control_mutex};
+    if (auto node = find_builtin_instrument(id))
+        node->setGain(gain);
+}
+
+float aap::SimpleLinearAudioGraph::getBuiltinPeak(int id) {
+    const std::lock_guard<std::mutex> lock{control_mutex};
+    auto node = find_builtin_instrument(id);
+    return node ? node->getPeak() : 0.0f;
 }
 
 aap::AudioPluginNode* aap::SimpleLinearAudioGraph::find_plugin_node(RemotePluginInstance* instance) {

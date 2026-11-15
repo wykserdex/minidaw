@@ -10,6 +10,17 @@ import java.io.IOException
 import java.util.Locale
 import java.util.UUID
 
+const val PLAYLIST_STEPS = 4096
+const val PLAYLIST_LANES = 64
+const val MAX_PLAYLIST_CLIPS = 256
+
+data class ArrangementClip(
+    val id: String = UUID.randomUUID().toString(),
+    val trackId: String,
+    val lane: Int,
+    val startStep: Int
+)
+
 data class ProjectTrack(
     val id: String = UUID.randomUUID().toString(),
     var name: String,
@@ -20,8 +31,14 @@ data class ProjectTrack(
     var gain: Float = 1f,
     var muted: Boolean = false,
     var soloed: Boolean = false,
-    val parameters: MutableMap<Int, Double> = mutableMapOf()
-)
+    var drum: Boolean = false,
+    val parameters: MutableMap<Int, Double> = mutableMapOf(),
+    val builtinId: String? = null,
+    val samples: MutableMap<Int, String> = mutableMapOf(),
+    val sampleNames: MutableMap<Int, String> = mutableMapOf()
+) {
+    val isInstrument: Boolean get() = pluginId != null || builtinId != null
+}
 
 data class ProjectEffect(
     val id: String = UUID.randomUUID().toString(),
@@ -37,7 +54,8 @@ data class DawProject(
     var masterGain: Float = 1f,
     var masterMuted: Boolean = false,
     val tracks: MutableList<ProjectTrack> = mutableListOf(),
-    val effects: MutableList<ProjectEffect> = mutableListOf()
+    val effects: MutableList<ProjectEffect> = mutableListOf(),
+    val arrangement: MutableList<ArrangementClip> = mutableListOf()
 )
 
 class ProjectStore(context: Context) {
@@ -177,8 +195,29 @@ class ProjectStore(context: Context) {
             require(ids.add(track.id)) { "Duplicate track or effect ID" }
             displayName(track.name)
             track.pluginId?.let { validatePluginId(it) }
+            track.builtinId?.let {
+                require(it in setOf("sub", "poly", "drums")) { "Unknown built-in instrument" }
+            }
+            require(track.pluginId == null || track.builtinId == null) {
+                "A track cannot contain both a plugin and a built-in instrument"
+            }
+            require(!track.isInstrument || (track.audioFile == null && track.audioName == null)) {
+                "An instrument track cannot contain an audio clip"
+            }
             track.audioFile?.let { validateAudioFileName(it) }
             track.audioName?.let { displayName(it) }
+            require(track.samples.size <= 128 && track.sampleNames.size <= 128) { "Too many pads" }
+            for ((pitch, file) in track.samples) {
+                require(pitch in 0..127) { "Invalid pad pitch" }
+                validateAudioFileName(file)
+            }
+            for ((pitch, name) in track.sampleNames) {
+                require(pitch in 0..127 && pitch in track.samples) { "Sample name has no assigned pad" }
+                displayName(name)
+            }
+            require(track.isInstrument || (track.samples.isEmpty() && track.sampleNames.isEmpty())) {
+                "An audio track cannot contain pad samples"
+            }
             validateGain(track.gain)
             require(track.parameters.values.all { it.isFinite() }) { "Non-finite parameter value" }
             track.clip?.let { clip ->
@@ -198,6 +237,18 @@ class ProjectStore(context: Context) {
             displayName(effect.name)
             require(effect.parameters.values.all { it.isFinite() }) { "Non-finite parameter value" }
         }
+        require(project.arrangement.size <= MAX_PLAYLIST_CLIPS) { "Too many playlist clips" }
+        val placementIds = mutableSetOf<String>()
+        val tracksById = project.tracks.associateBy { it.id }
+        for (placement in project.arrangement) {
+            validateUuid(placement.id)
+            require(placementIds.add(placement.id)) { "Duplicate playlist clip ID" }
+            require(placement.lane in 0 until PLAYLIST_LANES) { "Invalid playlist lane" }
+            require(placement.startStep in 0 until PLAYLIST_STEPS) { "Invalid playlist start step" }
+            val track = tracksById[placement.trackId]
+            require(track != null) { "Playlist clip references an unknown track" }
+            require(track.clip != null || track.audioFile != null) { "Playlist source has no clip or audio file" }
+        }
     }
 
     private fun encodeProject(project: DawProject): JSONObject {
@@ -207,12 +258,16 @@ class ProjectStore(context: Context) {
                 .put("id", track.id)
                 .put("name", displayName(track.name))
                 .put("pluginId", track.pluginId ?: JSONObject.NULL)
+                .put("builtinId", track.builtinId ?: JSONObject.NULL)
+                .put("samples", encodePadStrings(track.samples))
+                .put("sampleNames", encodePadStrings(track.sampleNames, names = true))
                 .put("audioFile", track.audioFile ?: JSONObject.NULL)
                 .put("audioName", track.audioName?.let { displayName(it) } ?: JSONObject.NULL)
                 .put("clip", track.clip?.let { encodeClip(it) } ?: JSONObject.NULL)
                 .put("gain", track.gain.toDouble())
                 .put("muted", track.muted)
                 .put("soloed", track.soloed)
+                .put("drum", track.drum)
                 .put("parameters", encodeParameters(track.parameters)))
         }
         val effects = JSONArray()
@@ -223,6 +278,14 @@ class ProjectStore(context: Context) {
                 .put("name", displayName(effect.name))
                 .put("parameters", encodeParameters(effect.parameters)))
         }
+        val arrangement = JSONArray()
+        for (placement in project.arrangement) {
+            arrangement.put(JSONObject()
+                .put("id", placement.id)
+                .put("trackId", placement.trackId)
+                .put("lane", placement.lane)
+                .put("startStep", placement.startStep))
+        }
         return JSONObject()
             .put("version", 1)
             .put("id", project.id)
@@ -232,6 +295,7 @@ class ProjectStore(context: Context) {
             .put("masterMuted", project.masterMuted)
             .put("tracks", tracks)
             .put("effects", effects)
+            .put("arrangement", arrangement)
     }
 
     private fun encodeClip(clip: Clip): JSONObject {
@@ -248,6 +312,14 @@ class ProjectStore(context: Context) {
     private fun encodeParameters(parameters: Map<Int, Double>): JSONObject {
         val json = JSONObject()
         for ((id, value) in parameters.toSortedMap()) json.put(id.toString(), value)
+        return json
+    }
+
+    private fun encodePadStrings(values: Map<Int, String>, names: Boolean = false): JSONObject {
+        val json = JSONObject()
+        for ((pitch, value) in values.toSortedMap()) {
+            json.put(pitch.toString(), if (names) displayName(value) else value)
+        }
         return json
     }
 
@@ -270,7 +342,11 @@ class ProjectStore(context: Context) {
                 gain = gain(track, "gain"),
                 muted = boolean(track, "muted"),
                 soloed = boolean(track, "soloed"),
-                parameters = decodeParameters(track)
+                drum = track.optBoolean("drum", false),
+                parameters = decodeParameters(track),
+                builtinId = nullableString(track, "builtinId"),
+                samples = decodePadStrings(track, "samples"),
+                sampleNames = decodePadStrings(track, "sampleNames", names = true)
             ))
         }
         val effects = mutableListOf<ProjectEffect>()
@@ -284,6 +360,27 @@ class ProjectStore(context: Context) {
                 parameters = decodeParameters(effect)
             ))
         }
+        val arrangement = mutableListOf<ArrangementClip>()
+        if (json.has("arrangement")) {
+            val placements = array(json, "arrangement")
+            require(placements.length() <= MAX_PLAYLIST_CLIPS) { "Too many playlist clips" }
+            for (index in 0 until placements.length()) {
+                val placement = placements.get(index)
+                require(placement is JSONObject) { "Invalid playlist clip" }
+                arrangement.add(ArrangementClip(
+                    id = string(placement, "id"),
+                    trackId = string(placement, "trackId"),
+                    lane = integer(placement, "lane"),
+                    startStep = integer(placement, "startStep")
+                ))
+            }
+        } else {
+            for ((index, track) in tracks.withIndex()) {
+                if (track.clip != null || track.audioFile != null) {
+                    arrangement.add(ArrangementClip(trackId = track.id, lane = index, startStep = 0))
+                }
+            }
+        }
         return DawProject(
             id = string(json, "id"),
             name = displayName(string(json, "name")),
@@ -291,7 +388,8 @@ class ProjectStore(context: Context) {
             masterGain = gain(json, "masterGain"),
             masterMuted = boolean(json, "masterMuted"),
             tracks = tracks,
-            effects = effects
+            effects = effects,
+            arrangement = arrangement
         )
     }
 
@@ -326,6 +424,22 @@ class ProjectStore(context: Context) {
             parameters[id] = number(json, key)
         }
         return parameters
+    }
+
+    private fun decodePadStrings(owner: JSONObject, key: String, names: Boolean = false): MutableMap<Int, String> {
+        if (!owner.has(key)) return mutableMapOf()
+        val json = owner.get(key)
+        require(json is JSONObject && json.length() <= 128) { "Invalid pad map: $key" }
+        val values = mutableMapOf<Int, String>()
+        val keys = json.keys()
+        while (keys.hasNext()) {
+            val pitchKey = keys.next()
+            val pitch = pitchKey.toIntOrNull()
+            require(pitch != null && pitch in 0..127 && pitch.toString() == pitchKey) { "Invalid pad pitch" }
+            val value = string(json, pitchKey)
+            values[pitch] = if (names) displayName(value) else value.also { validateAudioFileName(it) }
+        }
+        return values
     }
 
     private fun string(json: JSONObject, key: String): String {

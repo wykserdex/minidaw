@@ -1,8 +1,10 @@
 #ifndef AAP_CORE_AUDIOGRAPHNODE_H
 #define AAP_CORE_AUDIOGRAPHNODE_H
 
+#include <array>
 #include <atomic>
 #include <mutex>
+#include <vector>
 #include "AudioDevice.h"
 #include "AAPMidiEventTranslator.h"
 #include <aap/core/host/plugin-instance.h>
@@ -174,7 +176,9 @@ namespace aap {
     class AudioTrackNode : public AudioGraphNode {
         using Clip = choc::buffer::ChannelArrayBuffer<float>;
         std::unique_ptr<Clip> clip{};
-        uint32_t current_frame_offset{0};
+        // Immutable during callbacks; replacement requires the graph's ControlScope.
+        std::vector<uint64_t> placements{0};
+        uint64_t timeline_frame{0};
         bool active{false};
         std::atomic<float> audio_gain{1.0f};
         std::atomic<float> last_block_peak{0.0f};
@@ -188,12 +192,66 @@ namespace aap {
         void setGain(float gain);
         float getPeak() const { return last_block_peak.load(std::memory_order_relaxed); }
         uint64_t getDecodedBytes() const;
+        uint64_t getDurationFrames() const;
+        static constexpr size_t max_placements = 256;
+        static constexpr uint64_t max_placement_start = uint64_t{1} << 53;
+        bool setPlacements(const std::vector<uint64_t>& starts);
 
         // Publication/replacement and decoding require the graph's ControlScope.
         // The budget includes decoding buffers, while the previous clip remains alive.
         bool load(uint8_t* bytes, int dataLength, const char* filename, uint64_t byteBudget);
     };
 
+    class BuiltinInstrumentNode : public AudioGraphNode {
+        using Clip = choc::buffer::ChannelArrayBuffer<float>;
+        static constexpr uint32_t event_capacity = 256;
+        static constexpr uint32_t voice_count = 16;
+        enum Stage { Off, Attack, Decay, Sustain, Release, Drum };
+        struct NoteEvent {
+            int pitch;
+            float velocity;
+            bool down;
+        };
+        struct Voice {
+            Stage stage{Off};
+            int pitch{-1};
+            float velocity{0}, envelope{0}, release_step{0};
+            float phase{0}, phase2{0}, increment{0}, filter{0}, noise_previous{0};
+            float last_left{0}, last_right{0}, tail_left{0}, tail_right{0};
+            uint32_t frame{0}, random{1}, tail_frames{0};
+            uint64_t serial{0};
+        };
+        int kind;
+        bool active{false};
+        std::array<std::unique_ptr<Clip>, 128> samples{};
+        std::array<Voice, voice_count> voices{};
+        std::array<NoteEvent, event_capacity> events{};
+        std::atomic<uint32_t> event_write{0}, event_read{0};
+        std::atomic<bool> event_overflow{false};
+        std::atomic<float> audio_gain{1.0f}, last_block_peak{0.0f};
+        uint64_t next_serial{0};
+        uint32_t fade_frames;
+        float sample_rate;
+        float attack_step, decay_step, sustain_level, release_frames;
+
+        void reset();
+        void releaseVoice(Voice& voice);
+        void retireVoice(Voice& voice);
+        void handleNote(const NoteEvent& event);
+        void renderVoice(Voice& voice, float& left, float& right);
+
+    public:
+        BuiltinInstrumentNode(AudioGraph* ownerGraph, int kind);
+        void start() override;
+        void pause() override;
+        void processAudio(AudioBuffer* audioData, int32_t numFrames) override;
+        void note(int pitch, float velocity, bool down);
+        void setGain(float gain);
+        float getPeak() const { return last_block_peak.load(std::memory_order_relaxed); }
+        uint64_t getDecodedBytes(int pitch) const;
+        bool loadSample(int pitch, uint8_t* bytes, int dataLength, const char* filename,
+                        uint64_t byteBudget);
+    };
 
     class MidiSourceNode : public AudioGraphNode {
         uint8_t* buffer;

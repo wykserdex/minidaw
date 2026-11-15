@@ -15,6 +15,11 @@ class FaderView(context: Context) : View(context) {
             invalidate()
         }
     var onFraction: ((Float) -> Unit)? = null
+    var accentColor = Flm.accent
+        set(value) {
+            field = value
+            invalidate()
+        }
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
@@ -25,12 +30,21 @@ class FaderView(context: Context) : View(context) {
         val bottom = height - pad
         paint.style = Paint.Style.FILL
         paint.color = Flm.panelAlt
-        canvas.drawRect(cx - width * 0.06f, top, cx + width * 0.06f, bottom, paint)
+        for (level in floatArrayOf(0f, 0.25f, 0.5f, 0.75f, 1f)) {
+            val y = bottom - (bottom - top) * level
+            canvas.drawRect(cx - width * 0.40f, y - 1f, cx + width * 0.40f, y + 1f, paint)
+        }
+        paint.color = Flm.bg
+        canvas.drawRoundRect(cx - width * 0.05f, top, cx + width * 0.05f, bottom, 3f, 3f, paint)
 
         val y = bottom - (bottom - top) * fraction
-        paint.color = Flm.accent
-        canvas.drawRect(cx - width * 0.30f, y - height * 0.05f,
-            cx + width * 0.30f, y + height * 0.05f, paint)
+        paint.color = accentColor
+        canvas.drawRect(cx - width * 0.025f, y, cx + width * 0.025f, bottom, paint)
+        val halfThumb = context.dp(7).toFloat()
+        canvas.drawRoundRect(cx - width * 0.30f, y - halfThumb,
+            cx + width * 0.30f, y + halfThumb, 3f, 3f, paint)
+        paint.color = Flm.bg
+        canvas.drawRect(cx - width * 0.22f, y - 1f, cx + width * 0.22f, y + 1f, paint)
     }
 
     @SuppressLint("ClickableViewAccessibility")

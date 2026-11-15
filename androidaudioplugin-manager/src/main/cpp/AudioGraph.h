@@ -48,8 +48,9 @@ namespace aap {
         std::vector<std::unique_ptr<AudioPluginNode>> sum_nodes{};
         std::vector<std::unique_ptr<AudioPluginNode>> chain_nodes{};
         std::vector<std::unique_ptr<AudioTrackNode>> audio_tracks{};
-        static constexpr uint64_t max_audio_track_bytes = 64ULL * 1024 * 1024;
-        uint64_t decoded_audio_track_bytes{0};
+        std::vector<std::unique_ptr<BuiltinInstrumentNode>> builtin_instruments{};
+        static constexpr uint64_t max_decoded_audio_bytes = 64ULL * 1024 * 1024;
+        uint64_t decoded_audio_bytes{0};
         std::atomic<float> master_gain{1.0f};
         std::mutex control_mutex{};
         std::atomic<bool> control_gate{true};
@@ -74,6 +75,7 @@ namespace aap {
         void set_plugin_locked(RemotePluginInstance* instance);
         AudioPluginNode* find_plugin_node(RemotePluginInstance* instance);
         AudioTrackNode* find_audio_track(int trackId);
+        BuiltinInstrumentNode* find_builtin_instrument(int id);
         void silence(AudioBuffer* audioData);
         void apply_master_gain_and_meter(AudioBuffer* audioData, int32_t numFrames);
         void pause_nodes();
@@ -96,8 +98,16 @@ namespace aap {
 
         int addAudioTrack();
         bool loadAudioTrack(int trackId, uint8_t* bytes, int dataLength, const char* filename);
+        bool setAudioTrackPlacements(int trackId, const std::vector<uint64_t>& starts);
+        uint64_t getAudioTrackDurationFrames(int trackId);
         void setAudioTrackGain(int trackId, float gain);
         float getAudioTrackPeak(int trackId);
+
+        int addBuiltinInstrument(int kind);
+        void builtinNote(int id, int pitch, float velocity, bool down);
+        bool loadBuiltinSample(int id, int pitch, uint8_t* bytes, int dataLength, const char* filename);
+        void setBuiltinGain(int id, float gain);
+        float getBuiltinPeak(int id);
 
         // Routes only the UMP groups set in the mask to the node that hosts this instance.
         // 0xFFFF broadcasts to every group (the original behaviour) and 0 mutes its MIDI input.
